@@ -765,6 +765,9 @@ def remesh_narrow_band_dc_lowmem(
 
         is_outer = sdf >= -eps * 0.1
         n_removed = (~is_outer).sum().item()
+        if verbose:
+            print(f"  SDF stats: min={sdf.min().item():.6f} max={sdf.max().item():.6f} eps={eps:.6f} threshold={-eps*0.1:.6f}")
+            print(f"  outer={is_outer.sum().item():,} inner={n_removed:,}")
         quad_indices = quad_indices[is_outer]
         intersected_dir = intersected_dir[is_outer]
 
@@ -781,6 +784,8 @@ def remesh_narrow_band_dc_lowmem(
 
         if verbose:
             print(f"  Removed {n_removed:,} inner quads, {L:,} remaining")
+            print(f"  mesh_vertices: {mesh_vertices.shape}, has_nan={torch.isnan(mesh_vertices).any().item()}")
+            print(f"  quad_indices: {quad_indices.shape}, min={quad_indices.min().item()}, max={quad_indices.max().item()}, has_neg={((quad_indices < 0).any()).item()}")
         del quad_centers, sdf, is_outer, used, new_idx
 
     # --- 6. Chunked Triangle Splitting ---
@@ -825,6 +830,13 @@ def remesh_narrow_band_dc_lowmem(
     mesh_triangles = torch.cat(all_triangles).reshape(-1, 3)
     del all_triangles, quad_indices, intersected_dir
 
+    if verbose:
+        print(f"After triangle split: verts={mesh_vertices.shape[0]:,} faces={mesh_triangles.shape[0]:,}")
+        print(f"  tri min={mesh_triangles.min().item()} max={mesh_triangles.max().item()} n_verts={mesh_vertices.shape[0]}")
+        has_invalid = (mesh_triangles < 0).any().item() or (mesh_triangles >= mesh_vertices.shape[0]).any().item()
+        print(f"  has_invalid_indices={has_invalid}")
+        print(f"  has_nan_verts={torch.isnan(mesh_vertices).any().item()}")
+
     # --- 7. Project back ---
     if project_back > 0:
         if verbose:
@@ -862,7 +874,7 @@ def _batched_unsigned_distance(bvh, positions, batch_size=500_000, return_uvw=Fa
 
 
 class Trellis2ExportGLB(io.ComfyNode):
-    """Voxel data -> simplify -> UV unwrap -> bake PBR -> export GLB."""
+    """All-in-one: load voxelgrid NPZ -> simplify -> UV unwrap -> bake PBR -> export GLB."""
 
     @classmethod
     def define_schema(cls):
@@ -871,16 +883,15 @@ class Trellis2ExportGLB(io.ComfyNode):
             display_name="TRELLIS.2 Export GLB",
             category="TRELLIS2",
             is_output_node=True,
-            description="""Textured GLB export from voxel data.
+            description="""All-in-one textured GLB export from voxelgrid data.
 
-Takes voxel output from "Inference" node and:
+Takes the voxelgrid_npz_path from "Shape to Textured Mesh" and:
 1. Optionally remeshes (Dual Contouring)
 2. Simplifies to decimation_target faces
 3. UV unwraps and bakes PBR textures
 4. Exports textured GLB""",
             inputs=[
-                io.Custom("TRELLIS2_VOXEL").Input("voxel",
-                    tooltip="Voxel data from Inference node."),
+                io.String.Input("voxelgrid_path"),
                 io.Int.Input("decimation_target", default=500000, min=1000, max=5000000, step=1000, optional=True),
                 io.Int.Input("texture_size", default=2048, min=512, max=8192, step=512, optional=True),
                 io.Boolean.Input("remesh", default=True, optional=True),
@@ -902,7 +913,7 @@ Takes voxel output from "Inference" node and:
     @classmethod
     def execute(
         cls,
-        voxel,
+        voxelgrid_path,
         decimation_target=500000,
         texture_size=2048,
         remesh=True,
@@ -912,6 +923,7 @@ Takes voxel output from "Inference" node and:
         double_sided=False,
         filename_prefix="trellis2",
     ):
+        import json
         import torch
         import cv2
         import cumesh as CuMesh
@@ -920,13 +932,19 @@ Takes voxel output from "Inference" node and:
 
         torch.cuda.empty_cache()
 
-        # --- 1. Extract tensors from voxel dict ---
-        vertices = voxel['vertices'].float() if torch.is_tensor(voxel['vertices']) else torch.tensor(voxel['vertices']).float()
-        faces = voxel['faces'].int() if torch.is_tensor(voxel['faces']) else torch.tensor(voxel['faces']).int()
-        coords = voxel['coords'].float() if torch.is_tensor(voxel['coords']) else torch.tensor(voxel['coords']).float()
-        attr_volume = voxel['attrs'].float() if torch.is_tensor(voxel['attrs']) else torch.tensor(voxel['attrs']).float()
-        voxel_size_f = float(voxel['voxel_size'])
-        attr_layout = voxel['layout']
+        # --- 1. Load voxelgrid NPZ ---
+        logger.info(f"ExportGLB: loading {voxelgrid_path}")
+        data = np.load(voxelgrid_path, allow_pickle=True)
+
+        vertices = torch.tensor(data['vertices'].astype(np.float32))
+        faces = torch.tensor(data['faces'].astype(np.int32))
+        coords = torch.tensor(data['coords'].astype(np.float32))
+        attr_volume = torch.tensor(data['attrs'].astype(np.float32))
+        voxel_size_raw = data['voxel_size']
+        voxel_size_f = float(voxel_size_raw[0]) if hasattr(voxel_size_raw, '__len__') else float(voxel_size_raw)
+
+        layout_raw = json.loads(str(data['layout']))
+        attr_layout = {k: slice(v[0], v[1]) for k, v in layout_raw.items()}
 
         logger.info(f"ExportGLB: {vertices.shape[0]} verts, {faces.shape[0]} faces, {coords.shape[0]} voxels")
 
@@ -966,12 +984,16 @@ Takes voxel output from "Inference" node and:
                 band=remesh_band,
                 project_back=0.9,
                 verbose=True,
+                remove_inner_faces=remove_inner_faces,
             )
             vertices = new_verts.cpu()
             faces = new_faces.cpu()
             del new_verts, new_faces
             torch.cuda.empty_cache()
             logger.info(f"Remeshed: {vertices.shape[0]} verts, {faces.shape[0]} faces")
+            logger.info(f"  faces min={faces.min().item()} max={faces.max().item()} n_verts={vertices.shape[0]}")
+            has_invalid = (faces < 0).any().item() or (faces >= vertices.shape[0]).any().item()
+            logger.info(f"  has_invalid_indices={has_invalid} has_nan_verts={torch.isnan(vertices).any().item()}")
 
         # --- 4. Fill holes + Build BVH from current mesh ---
         vertices = vertices.to(device)
@@ -1010,24 +1032,6 @@ Takes voxel output from "Inference" node and:
             # Remesh: just simplify (DC already cleaned topology)
             mesh.simplify(decimation_target, verbose=True)
             logger.info(f"After simplify: {mesh.num_vertices} verts, {mesh.num_faces} faces")
-
-        # --- 7. Remove inner faces (optional) ---
-        if remove_inner_faces:
-            logger.info("Removing inner faces...")
-            out_v, out_f = mesh.read()
-            face_centers = (out_v[out_f[:, 0].long()] + out_v[out_f[:, 1].long()] + out_v[out_f[:, 2].long()]) / 3.0
-            chunk_size = 524_288
-            signed_dists = torch.empty(face_centers.shape[0], dtype=torch.float32, device=device)
-            for ci in range(0, face_centers.shape[0], chunk_size):
-                end = min(ci + chunk_size, face_centers.shape[0])
-                signed_dists[ci:end] = bvh.signed_distance(face_centers[ci:end], mode='raystab')[0]
-            eps = (aabb[1] - aabb[0]).max().item() / grid_size.max().item()
-            is_outer = signed_dists >= -eps * 0.1
-            n_removed = (~is_outer).sum().item()
-            if n_removed > 0:
-                mesh.remove_faces(~is_outer)
-                mesh.remove_unreferenced_vertices()
-            logger.info(f"Removed {n_removed} inner faces, {mesh.num_faces} remaining")
 
         comfy.model_management.throw_exception_if_processing_interrupted()
 
@@ -1204,8 +1208,12 @@ Takes voxel output from "Inference" node and:
         output_dir = folder_paths.get_output_directory()
         output_path = os.path.join(output_dir, filename)
 
+        logger.info(f"Pre-export: verts={vertices_np.shape} faces={faces_np.shape} uvs={uvs_np.shape}")
+        logger.info(f"  verts has_nan={np.isnan(vertices_np).any()} faces min={faces_np.min()} max={faces_np.max()}")
+        logger.info(f"  uvs has_nan={np.isnan(uvs_np).any()} range=[{uvs_np.min():.3f}, {uvs_np.max():.3f}]")
+        logger.info(f"  trimesh valid={textured_mesh.is_volume if hasattr(textured_mesh, 'is_volume') else 'N/A'}")
         textured_mesh.export(output_path, file_type='glb')
-        logger.info(f"GLB exported: {output_path}")
+        logger.info(f"GLB exported: {output_path} size={os.path.getsize(output_path)} bytes")
 
         del textured_mesh, out_vertices, out_faces, out_uvs, out_normals, mesh
         gc.collect()
