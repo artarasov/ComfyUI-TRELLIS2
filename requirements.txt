@@ -1,6 +1,6 @@
 # comfy-env for isolated environments
-comfy-env==0.2.32
-comfy-3d-viewers==0.2.37
+comfy-env==0.2.41
+comfy-3d-viewers==0.2.41
 comfy-sparse-attn==0.0.8
 
 # 3D processing (for export nodes)
