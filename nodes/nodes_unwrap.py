@@ -302,7 +302,6 @@ Parameters:
                 io.Custom("TRIMESH").Input("trimesh"),
                 io.Custom("TRELLIS2_VOXELGRID").Input("voxelgrid"),
                 io.Int.Input("texture_size", default=2048, min=512, max=16384, step=512),
-                io.Boolean.Input("use_pytorch3d", default=False),
             ],
             outputs=[
                 io.Custom("TRIMESH").Output(display_name="trimesh"),
@@ -315,7 +314,6 @@ Parameters:
         trimesh,
         voxelgrid,
         texture_size=2048,
-        use_pytorch3d=False,
     ):
         import torch
         import cv2
@@ -390,80 +388,9 @@ Parameters:
 
         logger.info("Rasterizing in UV space...")
 
-        if use_pytorch3d:
-            from pytorch3d.structures import Meshes
-            from pytorch3d.renderer.mesh.rasterize_meshes import rasterize_meshes
-
-            # UV-space vertices: treat UVs as 2D positions with z=0
-            verts_uv = torch.cat([uvs * 2 - 1, torch.zeros_like(uvs[:, :1])], dim=-1).float()
-
-            rast_mask = torch.zeros(texture_size, texture_size, dtype=torch.bool, device=device)
-            rast_face_ids = torch.full((texture_size, texture_size), -1, dtype=torch.long, device=device)
-            rast_bary = torch.zeros(texture_size, texture_size, 3, dtype=torch.float32, device=device)
-
-            # Rasterize in chunks
-            chunk_size = 100000
-            for i in range(0, faces.shape[0], chunk_size):
-                comfy.model_management.throw_exception_if_processing_interrupted()
-                chunk_faces = faces[i:i+chunk_size].long()
-                meshes = Meshes(verts=[verts_uv], faces=[chunk_faces])
-                pix_to_face, _, bary_coords, _ = rasterize_meshes(
-                    meshes, image_size=texture_size,
-                    faces_per_pixel=1, perspective_correct=False,
-                    cull_backfaces=False,
-                )
-                chunk_hit = pix_to_face[0, :, :, 0] >= 0
-                chunk_face_ids = pix_to_face[0, :, :, 0] + i
-                rast_face_ids = torch.where(chunk_hit, chunk_face_ids, rast_face_ids)
-                rast_bary[chunk_hit] = bary_coords[0, :, :, 0][chunk_hit]
-                rast_mask |= chunk_hit
-                del meshes, pix_to_face, bary_coords, chunk_hit, chunk_face_ids
-
-            del verts_uv
-            comfy.model_management.soft_empty_cache()
-
-            mask = rast_mask
-
-            # Manual barycentric interpolation (replaces dr.interpolate)
-            face_verts = vertices_yup[faces[rast_face_ids[mask]].long()]  # [N, 3, 3]
-            valid_pos = (face_verts * rast_bary[mask].unsqueeze(-1)).sum(dim=1)
-            del rast_face_ids, rast_bary, rast_mask, face_verts
-        else:
-            import nvdiffrast.torch as dr
-
-            # Setup nvdiffrast
-            ctx = dr.RasterizeCudaContext()
-
-            # Prepare UVs for rasterization
-            uvs_rast = torch.cat([
-                uvs * 2 - 1,
-                torch.zeros_like(uvs[:, :1]),
-                torch.ones_like(uvs[:, :1])
-            ], dim=-1).unsqueeze(0)
-
-            rast = torch.zeros((1, texture_size, texture_size, 4), device=device, dtype=torch.float32)
-
-            # Rasterize in chunks
-            chunk_size = 100000
-            for i in range(0, faces.shape[0], chunk_size):
-                comfy.model_management.throw_exception_if_processing_interrupted()
-                rast_chunk, _ = dr.rasterize(
-                    ctx, uvs_rast, faces[i:i+chunk_size],
-                    resolution=[texture_size, texture_size],
-                )
-                mask_chunk = rast_chunk[..., 3:4] > 0
-                rast_chunk[..., 3:4] += i
-                rast = torch.where(mask_chunk, rast_chunk, rast)
-                del rast_chunk, mask_chunk
-
-            del ctx, uvs_rast
-            comfy.model_management.soft_empty_cache()
-
-            mask = rast[0, ..., 3] > 0
-
-            # Interpolate 3D positions
-            pos = dr.interpolate(vertices_yup.unsqueeze(0), rast, faces)[0][0]
-            valid_pos = pos[mask]
+        mask, valid_pos = _rasterize_uv(
+            vertices_yup, faces, uvs, texture_size, device,
+        )
 
         # Map to original mesh
         _, face_id, uvw = bvh.unsigned_distance(valid_pos, return_uvw=True)
@@ -873,6 +800,59 @@ def _batched_unsigned_distance(bvh, positions, batch_size=500_000, return_uvw=Fa
     )
 
 
+def _rasterize_uv(vertices, faces, uvs, texture_size, device):
+    """Rasterize mesh in UV space using DRTK and return (mask, valid_pos).
+
+    Args:
+        vertices: [V, 3] vertex positions
+        faces: [F, 3] face indices (int32)
+        uvs: [V, 2] UV coordinates in [0, 1]
+        texture_size: output texture resolution
+        device: torch device
+
+    Returns:
+        mask: [H, W] bool tensor — which pixels are covered
+        valid_pos: [N, 3] 3D positions for covered pixels
+    """
+    import torch
+    import drtk
+
+    chunk_size = 100_000
+    S = texture_size
+
+    verts_uv = torch.stack([
+        uvs[:, 0] * S - 0.5,
+        uvs[:, 1] * S - 0.5,
+        torch.ones(uvs.shape[0], device=device),
+    ], dim=-1).float().unsqueeze(0)  # [1, V, 3]
+
+    rast_face_ids = torch.full((S, S), -1, dtype=torch.int32, device=device)
+    for i in range(0, faces.shape[0], chunk_size):
+        import comfy.model_management
+        comfy.model_management.throw_exception_if_processing_interrupted()
+        chunk_vi = faces[i:i+chunk_size].int()
+        index_img = drtk.rasterize(verts_uv, chunk_vi, height=S, width=S)
+        chunk_hit = index_img[0] >= 0
+        rast_face_ids[chunk_hit] = (index_img[0][chunk_hit] + i).int()
+        del index_img, chunk_hit
+
+    mask = rast_face_ids >= 0
+
+    _, bary_img = drtk.render(verts_uv, faces.int(), rast_face_ids.unsqueeze(0))
+    # bary_img: [1, 3, H, W] -> [H, W, 3]
+    bary = bary_img[0].permute(1, 2, 0)
+
+    bary_masked = bary[mask]
+    face_ids = rast_face_ids[mask].long()
+    face_verts = vertices[faces[face_ids].long()]
+    valid_pos = (face_verts * bary_masked.unsqueeze(-1)).sum(dim=1)
+    del verts_uv, rast_face_ids, bary_img, bary, face_verts, bary_masked, face_ids
+
+    import comfy.model_management
+    comfy.model_management.soft_empty_cache()
+    return mask, valid_pos
+
+
 class Trellis2ExportGLB(io.ComfyNode):
     """All-in-one: load voxelgrid NPZ -> simplify -> UV unwrap -> bake PBR -> export GLB."""
 
@@ -897,8 +877,6 @@ Takes the voxelgrid_npz_path from "Shape to Textured Mesh" and:
                 io.Boolean.Input("remesh", default=True, optional=True),
                 io.Boolean.Input("pre_simplify", default=True, optional=True,
                     tooltip="Pre-simplify mesh before remesh to massively reduce VRAM. May lose very thin features."),
-                io.Boolean.Input("use_pytorch3d", default=False, optional=True,
-                    tooltip="Use pytorch3d for UV rasterization instead of nvdiffrast."),
                 io.Boolean.Input("remove_inner_faces", default=False, optional=True,
                     tooltip="Remove faces whose centers are inside the original mesh (removes internal geometry artifacts)."),
                 io.Boolean.Input("double_sided", default=False, optional=True,
@@ -918,7 +896,6 @@ Takes the voxelgrid_npz_path from "Shape to Textured Mesh" and:
         texture_size=2048,
         remesh=True,
         pre_simplify=True,
-        use_pytorch3d=False,
         remove_inner_faces=False,
         double_sided=False,
         filename_prefix="trellis2",
@@ -1059,73 +1036,9 @@ Takes the voxelgrid_npz_path from "Shape to Textured Mesh" and:
 
         # --- 9. Rasterize in UV space ---
         logger.info("Rasterizing UV space...")
-        if use_pytorch3d:
-            from pytorch3d.structures import Meshes
-            from pytorch3d.renderer.mesh.rasterize_meshes import rasterize_meshes
-
-            verts_uv = torch.cat([out_uvs * 2 - 1, torch.ones_like(out_uvs[:, :1])], dim=-1).float()
-            rast_mask = torch.zeros(texture_size, texture_size, dtype=torch.bool, device=device)
-            rast_face_ids = torch.full((texture_size, texture_size), -1, dtype=torch.long, device=device)
-            rast_bary = torch.zeros(texture_size, texture_size, 3, dtype=torch.float32, device=device)
-
-            chunk_size = 100_000
-            for i in range(0, out_faces.shape[0], chunk_size):
-                comfy.model_management.throw_exception_if_processing_interrupted()
-                chunk_faces = out_faces[i:i+chunk_size].long()
-                meshes = Meshes(verts=[verts_uv], faces=[chunk_faces])
-                pix_to_face, _, bary_coords, _ = rasterize_meshes(
-                    meshes, image_size=texture_size,
-                    faces_per_pixel=1, perspective_correct=False,
-                    cull_backfaces=False, bin_size=0,
-                )
-                chunk_hit = pix_to_face[0, :, :, 0] >= 0
-                chunk_face_ids = pix_to_face[0, :, :, 0] + i
-                rast_face_ids = torch.where(chunk_hit, chunk_face_ids, rast_face_ids)
-                rast_bary[chunk_hit] = bary_coords[0, :, :, 0][chunk_hit]
-                rast_mask |= chunk_hit
-                del meshes, pix_to_face, bary_coords, chunk_hit, chunk_face_ids
-
-            del verts_uv
-            torch.cuda.synchronize()
-
-            # pytorch3d pixel order is flipped on both axes vs nvdiffrast
-            rast_mask = rast_mask.flip(0).flip(1)
-            rast_face_ids = rast_face_ids.flip(0).flip(1)
-            rast_bary = rast_bary.flip(0).flip(1)
-
-            mask = rast_mask
-            face_verts = out_vertices[out_faces[rast_face_ids[mask]].long()]
-            valid_pos = (face_verts * rast_bary[mask].unsqueeze(-1)).sum(dim=1)
-            del rast_face_ids, rast_bary, rast_mask, face_verts
-        else:
-            import nvdiffrast.torch as dr
-
-            ctx = dr.RasterizeCudaContext()
-            uvs_rast = torch.cat([
-                out_uvs * 2 - 1,
-                torch.zeros_like(out_uvs[:, :1]),
-                torch.ones_like(out_uvs[:, :1]),
-            ], dim=-1).unsqueeze(0)
-            rast = torch.zeros((1, texture_size, texture_size, 4), device=device, dtype=torch.float32)
-
-            chunk_size = 100_000
-            for i in range(0, out_faces.shape[0], chunk_size):
-                comfy.model_management.throw_exception_if_processing_interrupted()
-                rast_chunk, _ = dr.rasterize(
-                    ctx, uvs_rast, out_faces[i:i+chunk_size],
-                    resolution=[texture_size, texture_size],
-                )
-                mask_chunk = rast_chunk[..., 3:4] > 0
-                rast_chunk[..., 3:4] += i
-                rast = torch.where(mask_chunk, rast_chunk, rast)
-                del rast_chunk, mask_chunk
-
-            del ctx, uvs_rast
-
-            mask = rast[0, ..., 3] > 0
-            pos = dr.interpolate(out_vertices.unsqueeze(0), rast, out_faces)[0][0]
-            valid_pos = pos[mask]
-            del rast, pos
+        mask, valid_pos = _rasterize_uv(
+            out_vertices, out_faces, out_uvs, texture_size, device,
+        )
 
         comfy.model_management.soft_empty_cache()
 
