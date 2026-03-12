@@ -971,6 +971,355 @@ def run_shape_generation(
     return raw_mesh_vertices, raw_mesh_faces, shape_slat_data, subs_data
 
 
+def _sample_sparse_structure_multiview(view_conds, ss_res, sampler_params, resolution, device, dtype, front_axis='z', blend_temperature=2.0):
+    """Multi-view variant of _sample_sparse_structure."""
+    from .trellis2.samplers import FlowEulerMultiViewGuidanceIntervalSampler
+
+    comfy.model_management.throw_exception_if_processing_interrupted()
+    flow_model = _load_model('sparse_structure_flow_model')
+    reso = flow_model.resolution
+    noise = torch.randn(1, flow_model.in_channels, reso, reso, reso, device=device, dtype=dtype)
+
+    default_params = _pipeline_config['sparse_structure_sampler']['params']
+    params = {**default_params, **sampler_params}
+    views = list(view_conds.keys())
+    sampler = FlowEulerMultiViewGuidanceIntervalSampler(sigma_min=1e-5, resolution=int(resolution))
+    z_s = sampler.sample(
+        flow_model, noise, conds=view_conds, views=views,
+        front_axis=front_axis, blend_temperature=blend_temperature,
+        **params, verbose=True, tqdm_desc="Sampling sparse structure (multi-view)",
+    ).samples
+
+    del noise
+    _unload_model('sparse_structure_flow_model')
+
+    comfy.model_management.throw_exception_if_processing_interrupted()
+    decoder = _load_model('sparse_structure_decoder')
+    model_dtype = next(decoder.parameters()).dtype
+    z_s = z_s.to(dtype=model_dtype)
+    decoded = decoder(z_s) > 0
+
+    del z_s
+    _unload_model('sparse_structure_decoder')
+
+    if ss_res != decoded.shape[2]:
+        ratio = decoded.shape[2] // ss_res
+        decoded = torch.nn.functional.max_pool3d(decoded.float(), ratio, ratio, 0) > 0.5
+    coords = torch.argwhere(decoded)[:, [0, 2, 3, 4]].int()
+    log.info(f"Active voxels: {coords.shape[0]}")
+
+    del decoded
+    gc.collect()
+    comfy.model_management.soft_empty_cache()
+
+    return coords
+
+
+def _sample_shape_slat_multiview(view_conds, model_key, coords, sampler_params, resolution, device, dtype, front_axis='z', blend_temperature=2.0):
+    """Multi-view variant of _sample_shape_slat."""
+    from .trellis2.sparse import SparseTensor
+    from .trellis2.samplers import FlowEulerMultiViewGuidanceIntervalSampler
+
+    comfy.model_management.throw_exception_if_processing_interrupted()
+    flow_model = _load_model(model_key)
+    noise = SparseTensor(
+        feats=torch.randn(coords.shape[0], flow_model.in_channels, device=device, dtype=dtype),
+        coords=coords,
+    )
+
+    default_params = _pipeline_config['shape_slat_sampler']['params']
+    params = {**default_params, **sampler_params}
+    views = list(view_conds.keys())
+    sampler = FlowEulerMultiViewGuidanceIntervalSampler(sigma_min=1e-5, resolution=int(resolution))
+    slat = sampler.sample(
+        flow_model, noise, conds=view_conds, views=views,
+        front_axis=front_axis, blend_temperature=blend_temperature,
+        **params, verbose=True, tqdm_desc="Sampling shape SLat (multi-view)",
+    ).samples
+
+    del noise
+    _unload_model(model_key)
+
+    std = torch.tensor(_pipeline_config['shape_slat_normalization']['std'])[None].to(device=slat.device, dtype=dtype)
+    mean = torch.tensor(_pipeline_config['shape_slat_normalization']['mean'])[None].to(device=slat.device, dtype=dtype)
+    slat = slat * std + mean
+
+    return slat
+
+
+def _sample_shape_slat_cascade_multiview(
+    lr_view_conds, hr_view_conds, lr_key, hr_key,
+    lr_resolution, hr_resolution_target,
+    coords, sampler_params, max_num_tokens,
+    device, dtype, front_axis='z', blend_temperature=2.0,
+):
+    """Multi-view variant of _sample_shape_slat_cascade."""
+    from .trellis2.sparse import SparseTensor
+    from .trellis2.samplers import FlowEulerMultiViewGuidanceIntervalSampler
+
+    default_params = _pipeline_config['shape_slat_sampler']['params']
+    params = {**default_params, **sampler_params}
+    views = list(lr_view_conds.keys())
+
+    # ---- LR pass ----
+    comfy.model_management.throw_exception_if_processing_interrupted()
+    flow_model_lr = _load_model(lr_key)
+    noise = SparseTensor(
+        feats=torch.randn(coords.shape[0], flow_model_lr.in_channels, device=device, dtype=dtype),
+        coords=coords,
+    )
+    sampler = FlowEulerMultiViewGuidanceIntervalSampler(sigma_min=1e-5, resolution=int(lr_resolution))
+    slat = sampler.sample(
+        flow_model_lr, noise, conds=lr_view_conds, views=views,
+        front_axis=front_axis, blend_temperature=blend_temperature,
+        **params, verbose=True, tqdm_desc="Sampling shape SLat LR (multi-view)",
+    ).samples
+
+    del noise
+    _unload_model(lr_key)
+
+    # Free LR conditioning
+    for view in lr_view_conds:
+        for k, v in lr_view_conds[view].items():
+            if torch.is_tensor(v):
+                lr_view_conds[view][k] = None
+    del lr_view_conds, coords
+    gc.collect()
+    comfy.model_management.soft_empty_cache()
+
+    std = torch.tensor(_pipeline_config['shape_slat_normalization']['std'])[None].to(device=slat.device, dtype=dtype)
+    mean = torch.tensor(_pipeline_config['shape_slat_normalization']['mean'])[None].to(device=slat.device, dtype=dtype)
+    slat = slat * std + mean
+
+    # ---- Upsample via decoder ----
+    comfy.model_management.throw_exception_if_processing_interrupted()
+    decoder = _load_model('shape_slat_decoder')
+    decoder.low_vram = True
+    model_dtype = next(decoder.parameters()).dtype
+    slat = slat.replace(feats=slat.feats.to(dtype=model_dtype))
+    hr_coords = decoder.upsample(slat, upsample_times=4)
+
+    del slat, std, mean
+    _unload_model('shape_slat_decoder')
+
+    hr_resolution = hr_resolution_target
+    while True:
+        quant_coords = torch.cat([
+            hr_coords[:, :1],
+            ((hr_coords[:, 1:] + 0.5) / lr_resolution * (hr_resolution // 16)).int(),
+        ], dim=1)
+        final_coords = quant_coords.unique(dim=0)
+        num_tokens = final_coords.shape[0]
+        if num_tokens < max_num_tokens or hr_resolution == 1024:
+            if hr_resolution != hr_resolution_target:
+                log.info(f"Resolution reduced to {hr_resolution} due to token limit")
+            break
+        hr_resolution -= 128
+
+    # Move to CPU to free GPU
+    hr_conds_cpu = {}
+    for view, cond in hr_view_conds.items():
+        hr_conds_cpu[view] = {k: v.cpu() if torch.is_tensor(v) else v for k, v in cond.items()}
+    coords_cpu = final_coords.cpu()
+    del hr_coords, final_coords, quant_coords, hr_view_conds
+    gc.collect()
+    comfy.model_management.soft_empty_cache()
+
+    # ---- HR pass ----
+    comfy.model_management.throw_exception_if_processing_interrupted()
+    flow_model = _load_model(hr_key)
+
+    hr_view_conds_device = {}
+    for view, cond in hr_conds_cpu.items():
+        hr_view_conds_device[view] = {k: v.to(device) if torch.is_tensor(v) else v for k, v in cond.items()}
+    del hr_conds_cpu
+    hr_final_coords = coords_cpu.to(device)
+    del coords_cpu
+
+    noise = SparseTensor(
+        feats=torch.randn(hr_final_coords.shape[0], flow_model.in_channels, device=device, dtype=dtype),
+        coords=hr_final_coords,
+    )
+    sampler = FlowEulerMultiViewGuidanceIntervalSampler(sigma_min=1e-5, resolution=int(hr_resolution))
+    slat = sampler.sample(
+        flow_model, noise, conds=hr_view_conds_device, views=views,
+        front_axis=front_axis, blend_temperature=blend_temperature,
+        **params, verbose=True, tqdm_desc="Sampling shape SLat HR (multi-view)",
+    ).samples
+
+    del noise, hr_final_coords, hr_view_conds_device
+    _unload_model(hr_key)
+
+    std = torch.tensor(_pipeline_config['shape_slat_normalization']['std'])[None].to(device=slat.device, dtype=dtype)
+    mean = torch.tensor(_pipeline_config['shape_slat_normalization']['mean'])[None].to(device=slat.device, dtype=dtype)
+    slat = slat * std + mean
+
+    return slat, hr_resolution
+
+
+def run_multiview_shape_generation(
+    model_config: Any,
+    view_conditionings: Dict[str, Dict[str, torch.Tensor]],
+    seed: int = 0,
+    ss_guidance_strength: float = 6.5,
+    ss_guidance_rescale: float = 0.05,
+    ss_sampling_steps: int = 12,
+    shape_guidance_strength: float = 6.5,
+    shape_guidance_rescale: float = 0.05,
+    shape_sampling_steps: int = 12,
+    max_num_tokens: int = 49152,
+    front_axis: str = 'z',
+    blend_temperature: float = 2.0,
+) -> Dict[str, Any]:
+    """
+    Multi-view shape generation.
+
+    Args:
+        model_config: Trellis2ModelConfig
+        view_conditionings: Dict of view_name -> conditioning dict (from run_conditioning)
+        front_axis: 'z' or 'x'
+        blend_temperature: Softmax temperature for view blending
+        (other args same as run_shape_generation)
+
+    Returns:
+        Tuple of (mesh_vertices, mesh_faces, shape_slat_data, subs_data)
+    """
+    import comfy.utils
+    import cumesh_vb as CuMesh
+
+    _init_config()
+
+    views = list(view_conditionings.keys())
+    log.info(f"Running multi-view shape generation (seed={seed}, views={views})...")
+    pbar = comfy.utils.ProgressBar(3)
+
+    device = comfy.model_management.get_torch_device()
+    compute_dtype = _DEFAULT_DTYPE
+    resolution = model_config["resolution"]
+
+    # Move all view conditionings to device
+    view_conds_on_device = {}
+    for view, cond in view_conditionings.items():
+        view_conds_on_device[view] = {
+            k: v.to(device=device, dtype=compute_dtype) if isinstance(v, torch.Tensor) else v
+            for k, v in cond.items()
+        }
+
+    ss_params = {
+        "steps": ss_sampling_steps,
+        "guidance_strength": ss_guidance_strength,
+        "guidance_rescale": ss_guidance_rescale,
+    }
+    shape_params = {
+        "steps": shape_sampling_steps,
+        "guidance_strength": shape_guidance_strength,
+        "guidance_rescale": shape_guidance_rescale,
+    }
+
+    torch.manual_seed(seed)
+
+    # Build per-view cond dicts for sparse structure (always 512)
+    ss_view_conds = {
+        view: {'cond': c['cond_512'], 'neg_cond': c['neg_cond']}
+        for view, c in view_conds_on_device.items()
+    }
+
+    # 1. Sample sparse structure
+    comfy.model_management.throw_exception_if_processing_interrupted()
+    ss_res = {'512': 32, '1024': 64, '1024_cascade': 32, '1536_cascade': 32}[resolution]
+    coords = _sample_sparse_structure_multiview(
+        ss_view_conds, ss_res, ss_params, resolution.rstrip('_cascade'),
+        device, compute_dtype, front_axis, blend_temperature,
+    )
+    pbar.update(1)
+
+    # 2. Sample shape structured latent
+    comfy.model_management.throw_exception_if_processing_interrupted()
+    torch.cuda.reset_peak_memory_stats()
+
+    if resolution == '512':
+        view_conds_512 = {
+            view: {'cond': c['cond_512'], 'neg_cond': c['neg_cond']}
+            for view, c in view_conds_on_device.items()
+        }
+        shape_slat = _sample_shape_slat_multiview(
+            view_conds_512, 'shape_slat_flow_model_512',
+            coords, shape_params, 512, device, compute_dtype,
+            front_axis, blend_temperature,
+        )
+        res = 512
+    elif resolution == '1024':
+        view_conds_1024 = {
+            view: {'cond': c['cond_1024'], 'neg_cond': c['neg_cond']}
+            for view, c in view_conds_on_device.items()
+        }
+        shape_slat = _sample_shape_slat_multiview(
+            view_conds_1024, 'shape_slat_flow_model_1024',
+            coords, shape_params, 1024, device, compute_dtype,
+            front_axis, blend_temperature,
+        )
+        res = 1024
+    elif resolution in ('1024_cascade', '1536_cascade'):
+        lr_view_conds = {
+            view: {'cond': c['cond_512'], 'neg_cond': c['neg_cond']}
+            for view, c in view_conds_on_device.items()
+        }
+        hr_view_conds = {
+            view: {'cond': c['cond_1024'], 'neg_cond': c['neg_cond']}
+            for view, c in view_conds_on_device.items()
+        }
+        target_res = 1024 if resolution == '1024_cascade' else 1536
+        shape_slat, res = _sample_shape_slat_cascade_multiview(
+            lr_view_conds, hr_view_conds,
+            'shape_slat_flow_model_512', 'shape_slat_flow_model_1024',
+            512, target_res,
+            coords, shape_params, max_num_tokens,
+            device, compute_dtype, front_axis, blend_temperature,
+        )
+    else:
+        raise ValueError(f"Invalid resolution: {resolution}")
+
+    # Free conditioning
+    for view in view_conds_on_device:
+        for k in list(view_conds_on_device[view].keys()):
+            view_conds_on_device[view][k] = None
+    gc.collect()
+    comfy.model_management.soft_empty_cache()
+
+    # 3. Decode shape
+    comfy.model_management.throw_exception_if_processing_interrupted()
+    meshes, subs = _decode_shape_slat(shape_slat, res, compute_dtype)
+
+    peak_mem = torch.cuda.max_memory_allocated() / 1024**2
+    log.info(f"Multi-view shape generation peak VRAM: {peak_mem:.0f} MB")
+    pbar.update(1)
+
+    comfy.model_management.soft_empty_cache()
+
+    mesh = meshes[0]
+    mesh.fill_holes()
+
+    cumesh = CuMesh.CuMesh()
+    cumesh.init(mesh.vertices, mesh.faces.int())
+    cumesh.unify_face_orientations()
+    raw_mesh_vertices, raw_mesh_faces = cumesh.read()
+    raw_mesh_vertices = raw_mesh_vertices.cpu()
+    raw_mesh_faces = raw_mesh_faces.cpu()
+    del cumesh
+
+    shape_slat_data = _serialize_for_ipc(shape_slat)
+    shape_slat_data['_resolution'] = res
+    subs_data = _serialize_for_ipc(subs)
+
+    del shape_slat, subs, meshes, mesh
+    gc.collect()
+    comfy.model_management.soft_empty_cache()
+
+    pbar.update(1)
+    log.info(f"Multi-view shape generated: {raw_mesh_vertices.shape[0]} verts, {raw_mesh_faces.shape[0]} faces")
+    return raw_mesh_vertices, raw_mesh_faces, shape_slat_data, subs_data
+
+
 def run_texture_generation(
     model_config: Any,
     conditioning: Dict[str, torch.Tensor],

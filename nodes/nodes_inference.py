@@ -670,10 +670,163 @@ Parameters:
         return io.NodeOutput(mesh)
 
 
+class Trellis2MultiViewImageToShape(io.ComfyNode):
+    """Generate 3D shape from multiple view images using spatial blending."""
+
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="Trellis2MultiViewImageToShape",
+            display_name="TRELLIS.2 Multi-View Image to Shape",
+            category="TRELLIS2",
+            description="""Generate 3D shape from multiple view images.
+
+At each sampling step, runs the model once per view and blends predictions
+based on which voxels face which direction. Supports up to 6 views.
+
+Front image + mask are required. Other views are optional — only provided
+views participate in blending.""",
+            inputs=[
+                io.Custom("TRELLIS2_MODEL_CONFIG").Input("model_config",
+                    tooltip="Model config from Load TRELLIS.2 Models node"),
+                # Front view (required)
+                io.Image.Input("front_image", tooltip="Front view image (required)"),
+                io.Mask.Input("front_mask", tooltip="Front view mask (required)"),
+                # Optional views
+                io.Image.Input("back_image", optional=True, tooltip="Back view image"),
+                io.Mask.Input("back_mask", optional=True, tooltip="Back view mask"),
+                io.Image.Input("left_image", optional=True, tooltip="Left view image"),
+                io.Mask.Input("left_mask", optional=True, tooltip="Left view mask"),
+                io.Image.Input("right_image", optional=True, tooltip="Right view image"),
+                io.Mask.Input("right_mask", optional=True, tooltip="Right view mask"),
+                io.Image.Input("top_image", optional=True, tooltip="Top view image"),
+                io.Mask.Input("top_mask", optional=True, tooltip="Top view mask"),
+                io.Image.Input("bottom_image", optional=True, tooltip="Bottom view image"),
+                io.Mask.Input("bottom_mask", optional=True, tooltip="Bottom view mask"),
+                # Sampling params
+                io.Int.Input("seed", default=0, min=0, max=2**31 - 1, optional=True,
+                             tooltip="Random seed for reproducible generation"),
+                io.Float.Input("ss_guidance_strength", default=6.5, min=0.0, max=99.99, step=0.01, optional=True,
+                               tooltip="Sparse structure CFG scale"),
+                io.Float.Input("ss_guidance_rescale", default=0.05, min=0.0, max=1.0, step=0.01, optional=True,
+                               tooltip="Sparse structure guidance rescale"),
+                io.Int.Input("ss_sampling_steps", default=12, min=1, max=50, step=1, optional=True,
+                             tooltip="Sparse structure sampling steps"),
+                io.Float.Input("shape_guidance_strength", default=6.5, min=0.0, max=99.99, step=0.01, optional=True,
+                               tooltip="Shape CFG scale"),
+                io.Float.Input("shape_guidance_rescale", default=0.05, min=0.0, max=1.0, step=0.01, optional=True,
+                               tooltip="Shape guidance rescale"),
+                io.Int.Input("shape_sampling_steps", default=12, min=1, max=50, step=1, optional=True,
+                             tooltip="Shape sampling steps"),
+                io.Int.Input("max_tokens", default=49152, min=16384, max=262144, step=4096, optional=True,
+                             tooltip="Max tokens for cascade. Lower = less VRAM."),
+                # Multi-view params
+                io.Combo.Input("front_axis", options=["z", "x"], default="z", optional=True,
+                               tooltip="Which 3D axis the front view faces. Z for most models."),
+                io.Float.Input("blend_temperature", default=2.0, min=0.1, max=10.0, step=0.1, optional=True,
+                               tooltip="Softmax temperature for view blending. Higher = sharper transitions between views."),
+                io.Combo.Input("background_color", options=["black", "gray", "white"], default="black", optional=True,
+                               tooltip="Background color for masked regions"),
+            ],
+            outputs=[
+                io.Custom("TRIMESH").Output(display_name="mesh"),
+                io.Custom("TRELLIS2_SHAPE_SLAT").Output(display_name="shape_slat"),
+                io.Custom("TRELLIS2_SUBS").Output(display_name="subs"),
+            ],
+        )
+
+    @classmethod
+    def execute(
+        cls,
+        model_config,
+        front_image,
+        front_mask,
+        back_image=None, back_mask=None,
+        left_image=None, left_mask=None,
+        right_image=None, right_mask=None,
+        top_image=None, top_mask=None,
+        bottom_image=None, bottom_mask=None,
+        seed=0,
+        ss_guidance_strength=6.5,
+        ss_guidance_rescale=0.05,
+        ss_sampling_steps=12,
+        shape_guidance_strength=6.5,
+        shape_guidance_rescale=0.05,
+        shape_sampling_steps=12,
+        max_tokens=49152,
+        front_axis='z',
+        blend_temperature=2.0,
+        background_color="black",
+    ):
+        import numpy as np
+        import torch
+        import trimesh as Trimesh
+        from .stages import run_conditioning, run_multiview_shape_generation
+
+        comfy.model_management.throw_exception_if_processing_interrupted()
+
+        resolution = model_config.get("resolution", "1024_cascade")
+        include_1024 = resolution in ("1024_cascade", "1536_cascade", "1024")
+
+        # Collect view images/masks
+        view_inputs = {'front': (front_image, front_mask)}
+        for name, img, msk in [
+            ('back', back_image, back_mask),
+            ('left', left_image, left_mask),
+            ('right', right_image, right_mask),
+            ('top', top_image, top_mask),
+            ('bottom', bottom_image, bottom_mask),
+        ]:
+            if img is not None:
+                if msk is None:
+                    # Default mask: all ones (fully visible)
+                    msk = torch.ones(img.shape[0], img.shape[1], img.shape[2])
+                view_inputs[name] = (img, msk)
+
+        log.info(f"Multi-view conditioning for views: {list(view_inputs.keys())}")
+
+        # Run conditioning for each view
+        view_conditionings = {}
+        for view_name, (img, msk) in view_inputs.items():
+            cond, _ = run_conditioning(
+                model_config=model_config,
+                image=img,
+                mask=msk,
+                include_1024=include_1024,
+                background_color=background_color,
+            )
+            view_conditionings[view_name] = cond
+
+        with torch.inference_mode():
+            mesh_verts, mesh_faces, shape_slat_data, subs_data = run_multiview_shape_generation(
+                model_config=model_config,
+                view_conditionings=view_conditionings,
+                seed=seed,
+                ss_guidance_strength=ss_guidance_strength,
+                ss_guidance_rescale=ss_guidance_rescale,
+                ss_sampling_steps=ss_sampling_steps,
+                shape_guidance_strength=shape_guidance_strength,
+                shape_guidance_rescale=shape_guidance_rescale,
+                shape_sampling_steps=shape_sampling_steps,
+                max_num_tokens=max_tokens,
+                front_axis=front_axis,
+                blend_temperature=blend_temperature,
+            )
+
+        # Convert to trimesh with Y-up -> Z-up coordinate swap
+        vertices = mesh_verts.numpy().astype(np.float32)
+        faces = mesh_faces.numpy()
+        vertices[:, 1], vertices[:, 2] = -vertices[:, 2].copy(), vertices[:, 1].copy()
+        mesh = Trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+
+        return io.NodeOutput(mesh, shape_slat_data, subs_data)
+
+
 NODE_CLASS_MAPPINGS = {
     "Trellis2RemoveBackground": Trellis2RemoveBackground,
     "Trellis2GetConditioning": Trellis2GetConditioning,
     "Trellis2ImageToShape": Trellis2ImageToShape,
+    "Trellis2MultiViewImageToShape": Trellis2MultiViewImageToShape,
     "Trellis2ShapeToTexturedMesh": Trellis2ShapeToTexturedMesh,
     "Trellis2LoadMesh": Trellis2LoadMesh,
     "Trellis2EncodeMesh": Trellis2EncodeMesh,
@@ -686,6 +839,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "Trellis2RemoveBackground": "TRELLIS.2 Remove Background",
     "Trellis2GetConditioning": "TRELLIS.2 Get Conditioning",
     "Trellis2ImageToShape": "TRELLIS.2 Image to Shape",
+    "Trellis2MultiViewImageToShape": "TRELLIS.2 Multi-View Image to Shape",
     "Trellis2ShapeToTexturedMesh": "TRELLIS.2 Shape to Textured Mesh",
     "Trellis2LoadMesh": "TRELLIS.2 Load Mesh",
     "Trellis2EncodeMesh": "TRELLIS.2 Encode Mesh",

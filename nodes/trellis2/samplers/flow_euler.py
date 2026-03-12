@@ -236,3 +236,211 @@ class FlowEulerGuidanceIntervalSampler(GuidanceIntervalSamplerMixin, ClassifierF
             - 'pred_x_0': a list of prediction of x_0.
         """
         return super().sample(model, noise, cond, steps, rescale_t, verbose, neg_cond=neg_cond, guidance_strength=guidance_strength, guidance_interval=guidance_interval, **kwargs)
+
+
+class FlowEulerMultiViewSampler(FlowEulerSampler):
+    """
+    Generate samples from a flow-matching model using Euler sampling
+    with spatial blending of multiple view conditionings.
+
+    Supports up to 6 views: front, back, left, right, top, bottom.
+    At each step, runs the model once per view and blends predictions
+    based on which voxels face which direction.
+    """
+
+    _VIEW_DIRS = {
+        'z': {
+            'front':  (0, 0, +1),
+            'back':   (0, 0, -1),
+            'right':  (+1, 0, 0),
+            'left':   (-1, 0, 0),
+            'top':    (0, +1, 0),
+            'bottom': (0, -1, 0),
+        },
+        'x': {
+            'front':  (+1, 0, 0),
+            'back':   (-1, 0, 0),
+            'right':  (0, 0, +1),
+            'left':   (0, 0, -1),
+            'top':    (0, +1, 0),
+            'bottom': (0, -1, 0),
+        },
+    }
+
+    def __init__(self, sigma_min: float, resolution: int):
+        super().__init__(sigma_min)
+        self.resolution = resolution
+
+    def _compute_view_weights_sparse(self, coords, views, front_axis='z', blend_temperature=2.0):
+        """Compute per-voxel blending weights for sparse tensors.
+
+        Args:
+            coords: [N, 4] sparse coords (batch, x, y, z)
+            views: list of active view names
+            front_axis: 'z' or 'x'
+            blend_temperature: softmax temperature
+
+        Returns:
+            weights: [N, num_views] tensor
+        """
+        # Normalize coordinates to [-1, 1]
+        x = (coords[:, 1].float() / self.resolution) * 2 - 1.0
+        y = (coords[:, 2].float() / self.resolution) * 2 - 1.0
+        z = (coords[:, 3].float() / self.resolution) * 2 - 1.0
+
+        dirs = self._VIEW_DIRS[front_axis]
+        scores = []
+        for view in views:
+            dx, dy, dz = dirs[view]
+            score = dx * x + dy * y + dz * z
+            scores.append(score)
+
+        scores = torch.stack(scores, dim=1)  # (N, num_views)
+        return torch.softmax(scores * blend_temperature, dim=1)
+
+    def _compute_view_weights_dense(self, shape, device, views, front_axis='z', blend_temperature=2.0):
+        """Compute blending weights for dense tensors (B, C, D, H, W).
+
+        Returns:
+            weights: [num_views, D, H, W] tensor
+        """
+        D, H, W = shape[2], shape[3], shape[4]
+        # D=X, H=Y, W=Z (standard 3D tensor layout)
+        dx = torch.linspace(-1, 1, D, device=device)
+        dy = torch.linspace(-1, 1, H, device=device)
+        dz = torch.linspace(-1, 1, W, device=device)
+        grid_x, grid_y, grid_z = torch.meshgrid(dx, dy, dz, indexing='ij')
+
+        dirs = self._VIEW_DIRS[front_axis]
+        scores = []
+        for view in views:
+            vx, vy, vz = dirs[view]
+            score = vx * grid_x + vy * grid_y + vz * grid_z
+            scores.append(score)
+
+        scores = torch.stack(scores, dim=0)  # (num_views, D, H, W)
+        return torch.softmax(scores * blend_temperature, dim=0)
+
+    @torch.no_grad()
+    def sample_once(
+        self,
+        model,
+        x_t,
+        t: float,
+        t_prev: float,
+        conds: Dict[str, Any],
+        views: List[str],
+        front_axis: str = 'z',
+        blend_temperature: float = 2.0,
+        **kwargs
+    ):
+        is_sparse = hasattr(x_t, 'coords')
+
+        if is_sparse:
+            weights = self._compute_view_weights_sparse(
+                x_t.coords, views, front_axis, blend_temperature)
+        else:
+            weights = self._compute_view_weights_dense(
+                x_t.shape, x_t.device, views, front_axis, blend_temperature)
+
+        pred_v_accum = 0
+        for i, view in enumerate(views):
+            cond = conds[view]
+            # _inference_model goes through mixin chain (CFG, interval)
+            if isinstance(cond, dict) and 'cond' in cond:
+                pred_v_view = self._inference_model(
+                    model, x_t, t, **cond, **kwargs)
+            else:
+                pred_v_view = self._inference_model(
+                    model, x_t, t, cond=cond, **kwargs)
+
+            if is_sparse:
+                w = weights[:, i].unsqueeze(1)
+                v_feats = pred_v_view.feats if hasattr(pred_v_view, 'feats') else pred_v_view
+                pred_v_accum = pred_v_accum + v_feats * w
+            else:
+                w = weights[i].unsqueeze(0).unsqueeze(0)  # (1, 1, D, H, W)
+                pred_v_accum = pred_v_accum + pred_v_view * w
+
+        if is_sparse:
+            pred_v = x_t.replace(feats=pred_v_accum)
+        else:
+            pred_v = pred_v_accum
+
+        pred_x_0, pred_eps = self._v_to_xstart_eps(x_t=x_t, t=t, v=pred_v)
+        pred_x_prev = x_t - (t - t_prev) * pred_v
+        return edict({"pred_x_prev": pred_x_prev, "pred_x_0": pred_x_0})
+
+    @torch.no_grad()
+    def sample(
+        self,
+        model,
+        noise,
+        conds: Dict[str, Any],
+        views: List[str],
+        steps: int = 50,
+        rescale_t: float = 1.0,
+        verbose: bool = True,
+        tqdm_desc: str = "Sampling (multi-view)",
+        front_axis: str = 'z',
+        blend_temperature: float = 2.0,
+        **kwargs
+    ):
+        import comfy.utils
+        pbar = comfy.utils.ProgressBar(steps)
+
+        sample = noise
+        t_seq = np.linspace(1, 0, steps + 1)
+        t_seq = rescale_t * t_seq / (1 + (rescale_t - 1) * t_seq)
+        t_seq = t_seq.tolist()
+        t_pairs = list((t_seq[i], t_seq[i + 1]) for i in range(steps))
+        ret = edict({"samples": None, "pred_x_t": [], "pred_x_0": []})
+
+        for t, t_prev in t_pairs:
+            out = self.sample_once(
+                model, sample, t, t_prev,
+                conds=conds, views=views,
+                front_axis=front_axis,
+                blend_temperature=blend_temperature,
+                **kwargs,
+            )
+            sample = out.pred_x_prev
+            ret.pred_x_t.append(out.pred_x_prev)
+            ret.pred_x_0.append(out.pred_x_0)
+            pbar.update(1)
+        ret.samples = sample
+        return ret
+
+
+class FlowEulerMultiViewGuidanceIntervalSampler(
+    GuidanceIntervalSamplerMixin,
+    ClassifierFreeGuidanceSamplerMixin,
+    FlowEulerMultiViewSampler,
+):
+    """Multi-view Euler sampler with CFG and guidance interval."""
+
+    @torch.no_grad()
+    def sample(
+        self,
+        model,
+        noise,
+        conds: Dict[str, Any],
+        views: List[str],
+        steps: int = 50,
+        rescale_t: float = 1.0,
+        guidance_strength: float = 3.0,
+        guidance_interval: Tuple[float, float] = (0.0, 1.0),
+        verbose: bool = True,
+        front_axis: str = 'z',
+        blend_temperature: float = 2.0,
+        **kwargs
+    ):
+        return super().sample(
+            model, noise, conds=conds, views=views,
+            steps=steps, rescale_t=rescale_t, verbose=verbose,
+            guidance_strength=guidance_strength,
+            guidance_interval=guidance_interval,
+            front_axis=front_axis,
+            blend_temperature=blend_temperature,
+            **kwargs,
+        )
