@@ -534,7 +534,7 @@ class SparseResBlockC2S3d(nn.Module):
         self._low_vram = bool(value)
 
     def _tiled_conv1_c2s(self, h, x, subdiv_bin):
-        """Fused tiled conv1→C2S. Never materializes full conv1 output.
+        """Fused tiled conv1->C2S. Never materializes full conv1 output.
 
         Returns (h_fine: SparseTensor, x_fine_feats_cpu: Tensor).
         """
@@ -566,7 +566,7 @@ class SparseResBlockC2S3d(nn.Module):
 
         max_tile = 500_000
         tiles = _partition_octree(spatial, max_tile)
-        print(f"[C2S3d] TILED: N={N:,} → {len(tiles)} tiles, alloc={_v()}MB", flush=True)
+        print(f"[C2S3d] TILED: N={N:,} -> {len(tiles)} tiles, alloc={_v()}MB", flush=True)
 
         h_feats_cpu = h.feats.cpu()
         x_feats_cpu = x.feats.cpu()
@@ -669,7 +669,7 @@ class SparseResBlockC2S3d(nn.Module):
 
         subdiv_binarized = subdiv.replace(subdiv.feats > 0) if subdiv is not None else None
 
-        # --- TILED PATH: fused conv1→C2S, never materializes full conv1 output ---
+        # --- TILED PATH: fused conv1->C2S, never materializes full conv1 output ---
         if self._low_vram and N > 1_000_000:
             h, x_feats_cpu = self._tiled_conv1_c2s(h, x, subdiv_binarized)
             del subdiv_binarized

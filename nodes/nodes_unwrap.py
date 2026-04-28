@@ -292,7 +292,7 @@ class Trellis2ProcessMesh(io.ComfyNode):
             category="TRELLIS2",
             description="""All-in-one mesh processing pipeline.
 
-Combines fill holes → remesh → simplify → cleanup → UV unwrap in a single
+Combines fill holes -> remesh -> simplify -> cleanup -> UV unwrap in a single
 CuMesh session for efficiency.
 
 Output mesh has UVs and normals ready for Rasterize PBR.""",
@@ -346,7 +346,7 @@ Output mesh has UVs and normals ready for Rasterize PBR.""",
         torch.cuda.reset_peak_memory_stats()
         _log_vram("ProcessMesh Start")
 
-        # Convert to torch, Z-up → Y-up
+        # Convert to torch, Z-up -> Y-up
         vertices = torch.tensor(trimesh.vertices, dtype=torch.float32).to(device)
         faces = torch.tensor(trimesh.faces, dtype=torch.int32).to(device)
         vertices[:, 1], vertices[:, 2] = vertices[:, 2].clone(), -vertices[:, 1].clone()
@@ -458,7 +458,7 @@ Output mesh has UVs and normals ready for Rasterize PBR.""",
         out_normals = cumesh.read_vertex_normals()[out_vmaps.to(device)].cpu().numpy()
         _print(f"After UV unwrap: {out_vertices.shape[0]} verts, {out_faces.shape[0]} faces")
 
-        # Y-up → Z-up
+        # Y-up -> Z-up
         out_vertices[:, 1], out_vertices[:, 2] = -out_vertices[:, 2].copy(), out_vertices[:, 1].copy()
         out_normals[:, 1], out_normals[:, 2] = -out_normals[:, 2].copy(), out_normals[:, 1].copy()
         out_uvs[:, 1] = 1 - out_uvs[:, 1]
@@ -1172,7 +1172,7 @@ Takes the voxelgrid_npz_path from "Shape to Textured Mesh" and:
 
         # --- 6. Simplify + cleanup ---
         if not remesh:
-            # No-remesh: aggressive simplify → cleanup → final simplify → cleanup
+            # No-remesh: aggressive simplify -> cleanup -> final simplify -> cleanup
             mesh.simplify(decimation_target * 3, verbose=True)
             logger.info(f"After initial simplify: {mesh.num_vertices} verts, {mesh.num_faces} faces")
             mesh.remove_duplicate_faces()
@@ -1277,7 +1277,7 @@ Takes the voxelgrid_npz_path from "Shape to Textured Mesh" and:
             doubleSided=double_sided,
         )
 
-        # --- 14. Coordinate conversion Y-up → Z-up ---
+        # --- 14. Coordinate conversion Y-up -> Z-up ---
         vertices_np = out_vertices.cpu().numpy()
         faces_np = out_faces.cpu().numpy()
         uvs_np = out_uvs.cpu().numpy()
