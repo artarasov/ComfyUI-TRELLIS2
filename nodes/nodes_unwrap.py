@@ -351,33 +351,17 @@ Output mesh has UVs and normals ready for Rasterize PBR.""",
         faces = torch.tensor(trimesh.faces, dtype=torch.int32).to(device)
         vertices[:, 1], vertices[:, 2] = vertices[:, 2].clone(), -vertices[:, 1].clone()
 
-        # Helper: remove small disconnected components by face count (on CPU tensors)
-        def _remove_floaters(verts, facs):
-            if min_component_faces <= 0:
-                return verts, facs
-            tmp = Trimesh.Trimesh(vertices=verts.cpu().numpy(), faces=facs.cpu().numpy(), process=False)
-            components = tmp.split(only_watertight=False)
-            kept = [c for c in components if len(c.faces) >= min_component_faces]
-            if not kept or len(kept) == len(components):
-                return verts, facs
-            merged = Trimesh.util.concatenate(kept)
-            logger.info(f"Removed {len(components) - len(kept)} components < {min_component_faces} faces, kept {len(kept)}")
-            return (
-                torch.tensor(merged.vertices, dtype=torch.float32, device=device),
-                torch.tensor(merged.faces, dtype=torch.int32, device=device),
-            )
-
         import sys
         def _print(msg):
             print(f"[ProcessMesh] {msg}", file=sys.stderr, flush=True)
 
-        # 1. Remove floaters (first pass)
-        _print(f"Removing floaters (min_component_faces={min_component_faces})...")
-        vertices, faces = _remove_floaters(vertices, faces)
-        _print(f"After floater removal: {vertices.shape[0]} verts, {faces.shape[0]} faces")
-
+        # 1. Init cumesh and remove floaters on GPU
         cumesh = CuMesh.CuMesh()
         cumesh.init(vertices, faces)
+        if min_component_faces > 0:
+            _print(f"Removing floaters (min_component_faces={min_component_faces})...")
+            cumesh.remove_small_connected_components(1e-5)
+            _print(f"After floater removal: {cumesh.num_vertices} verts, {cumesh.num_faces} faces")
 
         # 2. Optional remesh (quad dual contouring)
         if remesh:
@@ -402,13 +386,10 @@ Output mesh has UVs and normals ready for Rasterize PBR.""",
             _print(f"After remesh: {cumesh.num_vertices} verts, {cumesh.num_faces} faces")
             del curr_verts, curr_faces
 
-            # Remove floaters (second pass, after remesh)
+            # Remove floaters (second pass, after remesh) — on GPU
             _print("Removing floaters after remesh...")
-            new_verts, new_faces = cumesh.read()
-            new_verts, new_faces = _remove_floaters(new_verts, new_faces)
-            cumesh.init(new_verts, new_faces)
+            cumesh.remove_small_connected_components(1e-5)
             _print(f"After floater removal: {cumesh.num_vertices} verts, {cumesh.num_faces} faces")
-            del new_verts, new_faces
 
         comfy.model_management.throw_exception_if_processing_interrupted()
 
