@@ -101,16 +101,28 @@ def _encode_mesh_to_shape_slat(vertices, faces, resolution, device):
     batch_col = torch.zeros(voxel_indices.shape[0], 1, dtype=voxel_indices.dtype)
     coords = torch.cat([batch_col, voxel_indices], dim=1).to(device)
 
+    import sys
+    _ma = torch.cuda.memory_allocated
+    print(f"[encode] voxelized: {voxel_indices.shape[0]} voxels at resolution={resolution}", file=sys.stderr, flush=True)
+    print(f"[encode] voxel_indices: {voxel_indices.device}, dual_vertices: {dual_vertices.device}, intersected: {intersected.device}", file=sys.stderr, flush=True)
+    print(f"[encode] coords: {coords.shape} {coords.device}", file=sys.stderr, flush=True)
+    print(f"[encode] pre-load: alloc={_ma()//1048576}MB", file=sys.stderr, flush=True)
+
     # Load encoder to determine weight dtype
     comfy.model_management.throw_exception_if_processing_interrupted()
     encoder = _load_model('shape_slat_encoder')
     model_dtype = next(encoder.parameters()).dtype
+    print(f"[encode] encoder loaded: alloc={_ma()//1048576}MB", file=sys.stderr, flush=True)
 
     vertex_feats = (dual_vertices * resolution - voxel_indices.float()).to(device=device, dtype=model_dtype)
+    print(f"[encode] vertex_feats: {vertex_feats.shape} {vertex_feats.device} alloc={_ma()//1048576}MB", file=sys.stderr, flush=True)
     vertices_sparse = SparseTensor(feats=vertex_feats, coords=coords)
+    print(f"[encode] vertices_sparse built: alloc={_ma()//1048576}MB", file=sys.stderr, flush=True)
 
     intersected_feats = intersected.to(device=device, dtype=model_dtype)
     intersected_sparse = SparseTensor(feats=intersected_feats, coords=coords)
+    print(f"[encode] intersected_sparse built: alloc={_ma()//1048576}MB", file=sys.stderr, flush=True)
+    print(f"[encode] starting encoder forward...", file=sys.stderr, flush=True)
 
     shape_slat = encoder(vertices_sparse, intersected_sparse, sample_posterior=False)
 
@@ -691,7 +703,7 @@ def _decode_tex_slat(slat, subs=None):
     kwargs = {}
     if subs is not None:
         for i, sub in enumerate(subs):
-            subs[i] = sub.replace(feats=sub.feats.to(dtype=model_dtype))
+            subs[i] = sub.replace(feats=sub.feats.to(device=slat.feats.device, dtype=model_dtype))
         kwargs['guide_subs'] = subs
 
     ret = decoder(slat, **kwargs) * 0.5 + 0.5
@@ -806,6 +818,7 @@ def run_conditioning(
         cond_1024 = dinov3_model([pil_image])
     pbar.update(1)
 
+    _unload_model('dinov3')
     comfy.model_management.soft_empty_cache()
     pbar.update(1)
 

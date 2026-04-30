@@ -660,6 +660,35 @@ Parameters:
         gc.collect()
         comfy.model_management.soft_empty_cache()
 
+        # Debug: log trimesh output attributes
+        import sys
+        print(f"[RasterizePBR] Output trimesh:", file=sys.stderr, flush=True)
+        print(f"  vertices: {result.vertices.shape}", file=sys.stderr, flush=True)
+        print(f"  faces: {result.faces.shape}", file=sys.stderr, flush=True)
+        print(f"  visual type: {type(result.visual).__name__}", file=sys.stderr, flush=True)
+        if hasattr(result.visual, 'uv') and result.visual.uv is not None:
+            print(f"  UVs: {result.visual.uv.shape}", file=sys.stderr, flush=True)
+        else:
+            print(f"  UVs: None", file=sys.stderr, flush=True)
+        if hasattr(result.visual, 'material') and result.visual.material is not None:
+            mat = result.visual.material
+            print(f"  material type: {type(mat).__name__}", file=sys.stderr, flush=True)
+            if hasattr(mat, 'baseColorTexture') and mat.baseColorTexture is not None:
+                print(f"  baseColorTexture: {mat.baseColorTexture.size} mode={mat.baseColorTexture.mode}", file=sys.stderr, flush=True)
+            else:
+                print(f"  baseColorTexture: None", file=sys.stderr, flush=True)
+            if hasattr(mat, 'metallicRoughnessTexture') and mat.metallicRoughnessTexture is not None:
+                print(f"  metallicRoughnessTexture: {mat.metallicRoughnessTexture.size} mode={mat.metallicRoughnessTexture.mode}", file=sys.stderr, flush=True)
+            else:
+                print(f"  metallicRoughnessTexture: None", file=sys.stderr, flush=True)
+        else:
+            print(f"  material: None", file=sys.stderr, flush=True)
+        if hasattr(result, 'vertex_normals') and result.vertex_normals is not None:
+            print(f"  vertex_normals: {result.vertex_normals.shape}", file=sys.stderr, flush=True)
+        else:
+            print(f"  vertex_normals: None", file=sys.stderr, flush=True)
+        print(f"  vertex_attributes: {list(result.vertex_attributes.keys()) if hasattr(result, 'vertex_attributes') else 'None'}", file=sys.stderr, flush=True)
+
         return io.NodeOutput(result)
 
 
