@@ -11,6 +11,7 @@ hf_transfer = "*"
 hf_xet = "*"
 transformers = ">=4.56.0"
 safetensors = "*"
+timm = "*"
 comfy-aimdo = "*"
 comfy-sparse-attn = "*"
 trimesh = { version = "*", extras = ["easy"] }
