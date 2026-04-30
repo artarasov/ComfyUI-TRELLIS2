@@ -8,32 +8,20 @@ hf_transfer = "*"
 hf_xet = "*"
 transformers = ">=4.56.0"
 safetensors = "*"
-timm = "*"
-psutil = "*"
 comfy-aimdo = "*"
 comfy-sparse-attn = "*"
 trimesh = { version = "*", extras = ["easy"] }
 av = "*"
 
-# ML utilities
-kornia = "*"
-lpips = "*"
-einops = "*"
-zstandard = "*"
-
 # Image processing
 pillow = ">=9.0.0"
 opencv-python-headless = "*"
-
-# Image/video (for export/unwrap)
 imageio = ">=2.0.0"
-imageio-ffmpeg = ">=0.4.0"
 
 # General
 numpy = ">=1.21.0"
 easydict = "*"
 tqdm = "*"
-plyfile = "*"
 
 [env_vars]
 PYTORCH_CUDA_ALLOC_CONF = "expandable_segments:True"
