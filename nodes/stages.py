@@ -950,14 +950,10 @@ def run_shape_generation(
     gc.collect()
     torch.cuda.empty_cache()
 
-    # Unify face orientations and save for texture stage + mesh extraction
-    cumesh = CuMesh.CuMesh()
-    cumesh.init(mesh.vertices, mesh.faces.int())
-    cumesh.unify_face_orientations()
-    raw_mesh_vertices, raw_mesh_faces = cumesh.read()
-    raw_mesh_vertices = raw_mesh_vertices.cpu()
-    raw_mesh_faces = raw_mesh_faces.cpu()
-    del cumesh, mesh
+    # Save raw mesh — ProcessMesh handles cleanup (unify, fill holes, etc.)
+    raw_mesh_vertices = mesh.vertices.cpu()
+    raw_mesh_faces = mesh.faces.cpu()
+    del mesh
     gc.collect()
     comfy.model_management.soft_empty_cache()
 
