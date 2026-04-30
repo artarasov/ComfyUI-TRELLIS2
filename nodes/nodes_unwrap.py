@@ -352,18 +352,20 @@ Output mesh has UVs and normals ready for Rasterize PBR.""",
         vertices[:, 1], vertices[:, 2] = vertices[:, 2].clone(), -vertices[:, 1].clone()
 
         import sys
+        _ma = torch.cuda.memory_allocated
+        _v = lambda: _ma() // 1048576
         def _print(msg):
-            print(f"[ProcessMesh] {msg}", file=sys.stderr, flush=True)
+            print(f"[ProcessMesh] {msg} (alloc={_v()}MB)", file=sys.stderr, flush=True)
 
-        # 1. Init cumesh and remove floaters on GPU
+        _print(f"Input: {vertices.shape[0]} verts, {faces.shape[0]} faces")
+
+        # 1. Init cumesh
         cumesh = CuMesh.CuMesh()
         cumesh.init(vertices, faces)
-        if min_component_faces > 0:
-            _print(f"Removing floaters (min_component_faces={min_component_faces})...")
-            cumesh.remove_small_connected_components(1e-5)
-            _print(f"After floater removal: {cumesh.num_vertices} verts, {cumesh.num_faces} faces")
+        del vertices, faces
 
-        # 2. Optional remesh (quad dual contouring)
+        # 2. Remesh first (reduces 20M+ faces to ~500K) — do this BEFORE
+        #    floater removal so we don't OOM building adjacency on the full mesh
         if remesh:
             curr_verts, curr_faces = cumesh.read()
 
@@ -386,8 +388,9 @@ Output mesh has UVs and normals ready for Rasterize PBR.""",
             _print(f"After remesh: {cumesh.num_vertices} verts, {cumesh.num_faces} faces")
             del curr_verts, curr_faces
 
-            # Remove floaters (second pass, after remesh) — on GPU
-            _print("Removing floaters after remesh...")
+        # 3. Remove floaters (now on the smaller remeshed mesh)
+        if min_component_faces > 0:
+            _print(f"Removing floaters (min_component_faces={min_component_faces})...")
             cumesh.remove_small_connected_components(1e-5)
             _print(f"After floater removal: {cumesh.num_vertices} verts, {cumesh.num_faces} faces")
 
