@@ -940,7 +940,15 @@ def run_shape_generation(
     comfy.model_management.soft_empty_cache()
 
     mesh = meshes[0]
-    mesh.fill_holes()
+
+    # Serialize shape_slat and subs to CPU — they're huge sparse tensors
+    # on GPU that aren't needed for mesh post-processing.
+    shape_slat_data = _serialize_for_ipc(shape_slat)
+    shape_slat_data['_resolution'] = res
+    subs_data = _serialize_for_ipc(subs)
+    del shape_slat, subs, meshes
+    gc.collect()
+    torch.cuda.empty_cache()
 
     # Unify face orientations and save for texture stage + mesh extraction
     cumesh = CuMesh.CuMesh()
@@ -949,15 +957,7 @@ def run_shape_generation(
     raw_mesh_vertices, raw_mesh_faces = cumesh.read()
     raw_mesh_vertices = raw_mesh_vertices.cpu()
     raw_mesh_faces = raw_mesh_faces.cpu()
-    del cumesh
-
-    # Serialize SparseTensor objects to dicts for IPC
-    shape_slat_data = _serialize_for_ipc(shape_slat)
-    shape_slat_data['_resolution'] = res
-    subs_data = _serialize_for_ipc(subs)
-
-    # Free GPU refs from locals that are now serialized
-    del shape_slat, subs, meshes, mesh
+    del cumesh, mesh
     gc.collect()
     comfy.model_management.soft_empty_cache()
 

@@ -792,44 +792,58 @@ class SparseConvNeXtBlock3d(nn.Module):
     def _forward(self, x: sp.SparseTensor) -> sp.SparseTensor:
         h = self.conv(x)
         _CHUNK = 1_000_000
-        if self.low_vram and h.feats.shape[0] > _CHUNK:
-            # Offload conv output to CPU, norm in chunks to avoid OOM
-            h_cpu = h.feats.to('cpu', non_blocking=True)
+        N = h.feats.shape[0]
+        if self.low_vram and N > _CHUNK:
+            # Full CPU-offload path: norm + MLP + residual all chunked.
+            # At 18M+ voxels, even one full tensor exceeds available VRAM.
             dev = h.feats.device
+            h_cpu = h.feats.to('cpu', non_blocking=True)
             torch.cuda.current_stream().synchronize()
             del h
             torch.cuda.empty_cache()
-            chunks = []
-            for i in range(0, h_cpu.shape[0], _CHUNK):
-                c = h_cpu[i:i+_CHUNK].to(dev)
-                chunks.append(self.norm(c).cpu())
+            if self.low_vram:
+                x.clear_spatial_cache()
+
+            # norm -> MLP -> residual, all in 1M chunks on GPU
+            x_feats_cpu = x.feats.cpu() if x.feats.device.type == 'cuda' else x.feats
+            out_chunks = []
+            for i in range(0, N, _CHUNK):
+                end = min(i + _CHUNK, N)
+                c = h_cpu[i:end].to(dev)
+                normed = self.norm(c)
                 del c
-            norm_feats = torch.cat(chunks).to(dev)
-            del chunks, h_cpu
+                mlp_out = self.mlp(normed)
+                del normed
+                mlp_out += x_feats_cpu[i:end].to(dev)  # residual
+                out_chunks.append(mlp_out.cpu())
+                del mlp_out
+            del h_cpu, x_feats_cpu
+            feats = torch.cat(out_chunks).to(dev)
+            del out_chunks
+            return x.replace(feats)
         else:
             norm_feats = self.norm(h.feats)
             del h  # free conv output feats before MLP expansion
-        if self.low_vram:
-            x.clear_spatial_cache()  # Free neighbor cache during MLP (rebuilt next block)
-        steps = max(1, (norm_feats.shape[0] + self.mlp_chunk_size - 1) // self.mlp_chunk_size) if self.low_vram else 1
-        while True:
-            try:
-                chunk_size = (norm_feats.shape[0] + steps - 1) // steps if steps > 1 else 0
-                feats = _apply_in_chunks(self.mlp, norm_feats, chunk_size)
-                break
-            except comfy.model_management.OOM_EXCEPTION as e:
-                comfy.model_management.soft_empty_cache(True)
-                steps *= 2
-                if steps > 64:
-                    raise e
-        del norm_feats  # free norm output before residual add
-        # x.feats may be on CPU (tiled conv offloads input) — move back for residual
-        x_feats = x.feats
-        if x_feats.device != feats.device:
-            x_feats = x_feats.to(feats.device)
-        feats.add_(x_feats)  # in-place residual
-        del x_feats
-        return x.replace(feats)
+            if self.low_vram:
+                x.clear_spatial_cache()
+            steps = max(1, (norm_feats.shape[0] + self.mlp_chunk_size - 1) // self.mlp_chunk_size) if self.low_vram else 1
+            while True:
+                try:
+                    chunk_size = (norm_feats.shape[0] + steps - 1) // steps if steps > 1 else 0
+                    feats = _apply_in_chunks(self.mlp, norm_feats, chunk_size)
+                    break
+                except comfy.model_management.OOM_EXCEPTION as e:
+                    comfy.model_management.soft_empty_cache(True)
+                    steps *= 2
+                    if steps > 64:
+                        raise e
+            del norm_feats
+            x_feats = x.feats
+            if x_feats.device != feats.device:
+                x_feats = x_feats.to(feats.device)
+            feats.add_(x_feats)
+            del x_feats
+            return x.replace(feats)
 
     def forward(self, x: sp.SparseTensor) -> sp.SparseTensor:
         if self.use_checkpoint:
@@ -1068,10 +1082,16 @@ class SparseUnetVaeDecoder(nn.Module):
 
         _CHUNK = 1_000_000
         if self.low_vram and h.feats.shape[0] > _CHUNK:
+            dev = h.feats.device
             norm_shape = h.feats.shape[-1:]
-            chunks = [F.layer_norm(h.feats[i:i+_CHUNK], norm_shape) for i in range(0, h.feats.shape[0], _CHUNK)]
-            h = h.replace(torch.cat(chunks))
-            del chunks
+            h_cpu = h.feats.to('cpu', non_blocking=True)
+            torch.cuda.current_stream().synchronize()
+            h = h.replace(torch.empty(0, dtype=h_cpu.dtype, device=dev))
+            torch.cuda.empty_cache()
+            chunks = [F.layer_norm(h_cpu[i:i+_CHUNK].to(dev), norm_shape).cpu()
+                      for i in range(0, h_cpu.shape[0], _CHUNK)]
+            h = h.replace(torch.cat(chunks).to(dev))
+            del chunks, h_cpu
         else:
             h = h.replace(F.layer_norm(h.feats, h.feats.shape[-1:]))
         h = self.output_layer(h)
@@ -1336,6 +1356,31 @@ class FlexiDualGridVaeDecoder(SparseUnetVaeDecoder):
         quad_lerp = h.replace(F.softplus(h.feats[..., 6:7]))
         extra = out_list[1:]
         del h, out_list
+
+        # Free everything possible before mesh extraction
+        _ma = torch.cuda.memory_allocated
+        _v = lambda: _ma() // 1048576
+        print(f"[FlexiDecoder] pre-cleanup: alloc={_v()}MB", flush=True)
+        self.to('cpu')
+        print(f"[FlexiDecoder] model to CPU: alloc={_v()}MB", flush=True)
+        # Move subs to CPU
+        for ei, item in enumerate(extra):
+            if isinstance(item, (list, tuple)):
+                for si, sub in enumerate(item):
+                    if hasattr(sub, 'feats') and sub.feats.is_cuda:
+                        print(f"[FlexiDecoder] extra[{ei}][{si}] feats={sub.feats.shape} on {sub.feats.device}, {sub.feats.numel()*sub.feats.element_size()//1048576}MB", flush=True)
+                        extra[ei][si] = sub.replace(sub.feats.cpu())
+            elif hasattr(item, 'feats') and item.feats.is_cuda:
+                print(f"[FlexiDecoder] extra[{ei}] feats={item.feats.shape} on {item.feats.device}, {item.feats.numel()*item.feats.element_size()//1048576}MB", flush=True)
+                extra[ei] = item.replace(item.feats.cpu())
+        print(f"[FlexiDecoder] subs to CPU: alloc={_v()}MB", flush=True)
+        # Log what's still on GPU
+        print(f"[FlexiDecoder] coords: {coords.shape} {coords.device} {coords.numel()*coords.element_size()//1048576}MB", flush=True)
+        print(f"[FlexiDecoder] vertices.feats: {vertices.feats.shape} {vertices.feats.device} {vertices.feats.numel()*vertices.feats.element_size()//1048576}MB", flush=True)
+        print(f"[FlexiDecoder] intersected.feats: {intersected.feats.shape} {intersected.feats.device} {intersected.feats.numel()*intersected.feats.element_size()//1048576}MB", flush=True)
+        print(f"[FlexiDecoder] quad_lerp.feats: {quad_lerp.feats.shape} {quad_lerp.feats.device} {quad_lerp.feats.numel()*quad_lerp.feats.element_size()//1048576}MB", flush=True)
+        torch.cuda.empty_cache()
+        print(f"[FlexiDecoder] post-cleanup: alloc={_v()}MB, starting mesh extraction", flush=True)
 
         mesh = [Mesh(*_tiled_vb(
             coords=coords,
