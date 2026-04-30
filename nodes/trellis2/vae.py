@@ -704,21 +704,57 @@ class SparseResBlockC2S3d(nn.Module):
 
         # --- conv2 + skip (shared by both paths) ---
         h.clear_spatial_cache()
-        h = h.replace(self.norm2(h.feats))
-        print(f"[C2S3d] after norm2: alloc={_v()}MB", flush=True)
-        h = h.replace(F.silu(h.feats))
-        print(f"[C2S3d] after silu: alloc={_v()}MB", flush=True)
+        N = h.feats.shape[0]
+        _CHUNK = 1_000_000
+
+        if self._low_vram and N > _CHUNK:
+            # Offload h.feats to CPU, process norm2+silu in chunks on GPU,
+            # then reassemble.  Without offloading first, the full h.feats
+            # (2+ GB) stays on GPU and even a small chunk can't fit.
+            dev = h.feats.device
+            h_cpu = h.feats.to('cpu', non_blocking=True)
+            torch.cuda.current_stream().synchronize()
+            h = h.replace(torch.empty(0, dtype=h_cpu.dtype, device=dev))
+            torch.cuda.empty_cache()
+            print(f"[C2S3d] h.feats offloaded for chunked norm2+silu: alloc={_v()}MB", flush=True)
+            out_chunks = []
+            for i in range(0, N, _CHUNK):
+                c = h_cpu[i:i+_CHUNK].to(dev)
+                out_chunks.append(F.silu(self.norm2(c)).cpu())
+                del c
+            h = h.replace(torch.cat(out_chunks).to(dev))
+            del out_chunks, h_cpu
+            torch.cuda.empty_cache()
+            print(f"[C2S3d] after chunked norm2+silu: alloc={_v()}MB", flush=True)
+        else:
+            h = h.replace(self.norm2(h.feats))
+            print(f"[C2S3d] after norm2: alloc={_v()}MB", flush=True)
+            h = h.replace(F.silu(h.feats))
+            print(f"[C2S3d] after silu: alloc={_v()}MB", flush=True)
+
         h = self.conv2(h)
         print(f"[C2S3d] post-conv2: alloc={_v()}MB", flush=True)
         h.clear_spatial_cache()
         print(f"[C2S3d] post-conv2 (cache cleared): alloc={_v()}MB", flush=True)
+
         R = self.out_channels // (self.channels // 8)
-        skip_feats = x_feats_cpu.repeat_interleave(R, dim=1).to(h.feats.device)
-        del x_feats_cpu
-        print(f"[C2S3d] after skip expand: alloc={_v()}MB", flush=True)
-        h = h.replace(h.feats + skip_feats)
-        del skip_feats
-        print(f"[C2S3d] post-skip: alloc={_v()}MB", flush=True)
+        if self._low_vram and N > _CHUNK:
+            # Chunked skip to avoid materializing full repeat_interleave
+            dev = h.feats.device
+            for i in range(0, N, _CHUNK):
+                end = min(i + _CHUNK, N)
+                skip_chunk = x_feats_cpu[i:end].repeat_interleave(R, dim=1).to(dev)
+                h.feats[i:end] += skip_chunk
+                del skip_chunk
+            del x_feats_cpu
+            print(f"[C2S3d] after chunked skip: alloc={_v()}MB", flush=True)
+        else:
+            skip_feats = x_feats_cpu.repeat_interleave(R, dim=1).to(h.feats.device)
+            del x_feats_cpu
+            print(f"[C2S3d] after skip expand: alloc={_v()}MB", flush=True)
+            h = h.replace(h.feats + skip_feats)
+            del skip_feats
+            print(f"[C2S3d] post-skip: alloc={_v()}MB", flush=True)
         if self.pred_subdiv:
             return h, subdiv
         else:
@@ -755,8 +791,24 @@ class SparseConvNeXtBlock3d(nn.Module):
 
     def _forward(self, x: sp.SparseTensor) -> sp.SparseTensor:
         h = self.conv(x)
-        norm_feats = self.norm(h.feats)
-        del h  # free conv output feats before MLP expansion
+        _CHUNK = 1_000_000
+        if self.low_vram and h.feats.shape[0] > _CHUNK:
+            # Offload conv output to CPU, norm in chunks to avoid OOM
+            h_cpu = h.feats.to('cpu', non_blocking=True)
+            dev = h.feats.device
+            torch.cuda.current_stream().synchronize()
+            del h
+            torch.cuda.empty_cache()
+            chunks = []
+            for i in range(0, h_cpu.shape[0], _CHUNK):
+                c = h_cpu[i:i+_CHUNK].to(dev)
+                chunks.append(self.norm(c).cpu())
+                del c
+            norm_feats = torch.cat(chunks).to(dev)
+            del chunks, h_cpu
+        else:
+            norm_feats = self.norm(h.feats)
+            del h  # free conv output feats before MLP expansion
         if self.low_vram:
             x.clear_spatial_cache()  # Free neighbor cache during MLP (rebuilt next block)
         steps = max(1, (norm_feats.shape[0] + self.mlp_chunk_size - 1) // self.mlp_chunk_size) if self.low_vram else 1
@@ -1014,7 +1066,14 @@ class SparseUnetVaeDecoder(nn.Module):
                     h = block(h)
                 pbar.update(1)
 
-        h = h.replace(F.layer_norm(h.feats, h.feats.shape[-1:]))
+        _CHUNK = 1_000_000
+        if self.low_vram and h.feats.shape[0] > _CHUNK:
+            norm_shape = h.feats.shape[-1:]
+            chunks = [F.layer_norm(h.feats[i:i+_CHUNK], norm_shape) for i in range(0, h.feats.shape[0], _CHUNK)]
+            h = h.replace(torch.cat(chunks))
+            del chunks
+        else:
+            h = h.replace(F.layer_norm(h.feats, h.feats.shape[-1:]))
         h = self.output_layer(h)
 
         pbar.update(1)

@@ -154,8 +154,9 @@ def _init_config():
 
     if not os.path.exists(config_file):
         from huggingface_hub import hf_hub_download
-        log.info("Downloading pipeline config from HuggingFace...")
+        print("[TRELLIS2] Downloading pipeline config from HuggingFace...", flush=True)
         hf_hub_download("microsoft/TRELLIS.2-4B", "pipeline.json", local_dir=models_dir)
+        print("[TRELLIS2] Pipeline config downloaded", flush=True)
 
     with open(config_file, 'r') as f:
         _pipeline_config = json.load(f)['args']
@@ -182,9 +183,10 @@ def _init_config():
             # Download if not cached
             from huggingface_hub import hf_hub_download
             os.makedirs(os.path.dirname(local_config), exist_ok=True)
-            log.info(f"Downloading {model_name}...")
+            print(f"[TRELLIS2] Downloading {model_name} from {repo_id}...", flush=True)
             hf_hub_download(repo_id, f"{model_name}.json", local_dir=models_dir)
             hf_hub_download(repo_id, f"{model_name}.safetensors", local_dir=models_dir)
+            print(f"[TRELLIS2] Downloaded {model_name}", flush=True)
             _model_paths[key] = local_weights
 
     # Register shape_slat_encoder (not in pipeline.json but needed for mesh encoding)
@@ -195,12 +197,13 @@ def _init_config():
         if not (os.path.exists(local_config) and os.path.exists(local_weights)):
             from huggingface_hub import hf_hub_download
             os.makedirs(os.path.dirname(local_config), exist_ok=True)
-            log.info(f"Downloading {encoder_model_name}...")
+            print(f"[TRELLIS2] Downloading {encoder_model_name}...", flush=True)
             hf_hub_download("microsoft/TRELLIS.2-4B", f"{encoder_model_name}.json", local_dir=models_dir)
             hf_hub_download("microsoft/TRELLIS.2-4B", f"{encoder_model_name}.safetensors", local_dir=models_dir)
+            print(f"[TRELLIS2] Downloaded {encoder_model_name}", flush=True)
         _model_paths['shape_slat_encoder'] = local_weights
 
-    log.info(f"Config loaded: {len(_model_paths)} models registered")
+    print(f"[TRELLIS2] Config loaded: {len(_model_paths)} models registered", flush=True)
 
 
 def _load_model(model_key, device=None):
