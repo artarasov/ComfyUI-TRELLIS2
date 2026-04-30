@@ -466,7 +466,7 @@ Output mesh has UVs and normals ready for Rasterize PBR.""",
 
         _print(f"Done: {len(result.vertices)} verts, {len(result.faces)} faces")
 
-        del vertices, faces, cumesh, out_vmaps
+        del cumesh, out_vmaps
         gc.collect()
         comfy.model_management.soft_empty_cache()
         _log_vram("ProcessMesh done")
