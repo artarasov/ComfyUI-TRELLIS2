@@ -1,6 +1,7 @@
 """Modular mesh processing nodes for TRELLIS.2."""
 import gc
 import os
+from io import BytesIO
 import numpy as np
 from PIL import Image
 from datetime import datetime
@@ -11,6 +12,215 @@ from comfy_api.latest import io
 
 from .utils import logger
 import comfy.model_management
+
+
+def _pil_to_jpeg(image, quality=85):
+    """Re-encode a PIL Image as JPEG so trimesh embeds JPEG (not PNG) in GLB.
+
+    Trimesh embeds RGBA/PNG textures as PNG; converting to RGB and re-saving
+    as JPEG forces JPEG embedding, shrinking GLB size. Drops alpha channel.
+    """
+    rgb = image.convert("RGB")
+    buf = BytesIO()
+    rgb.save(buf, format="JPEG", quality=quality)
+    buf.seek(0)
+    return Image.open(buf)
+
+
+_DRACO_EXT_NAME = "KHR_draco_mesh_compression"
+_DRACO_SUPPORTED_ATTRS = (
+    "POSITION", "NORMAL", "TANGENT",
+    "TEXCOORD_0", "TEXCOORD_1",
+    "COLOR_0", "JOINTS_0", "WEIGHTS_0",
+)
+_GLTF_COMPONENT_SIZES = {5120: 1, 5121: 1, 5122: 2, 5123: 2, 5125: 4, 5126: 4}
+_GLTF_TYPE_COUNTS = {"SCALAR": 1, "VEC2": 2, "VEC3": 3, "VEC4": 4, "MAT2": 4, "MAT3": 9, "MAT4": 16}
+
+
+def _draco_compress_glb(
+    glb_path,
+    compression_level=7,
+    position_bits=14,
+    normal_bits=10,
+    uv_bits=12,
+    color_bits=8,
+    generic_bits=12,
+):
+    """Post-process a GLB file in place to add KHR_draco_mesh_compression.
+
+    Optional dependency: requires `smtk_draco` and `pygltflib`. If either is
+    missing, logs a warning and returns without modifying the file.
+
+    For each mesh primitive, encodes vertex attributes (POSITION, NORMAL,
+    TEXCOORD_0, ...) and indices with Draco, then rewrites the GLB so the
+    primitive's accessors lose their bufferView and the primitive carries
+    a `KHR_draco_mesh_compression` extension referencing the encoded blob.
+    Image bufferViews are preserved.
+    """
+    try:
+        import smtk_draco as draco
+        from pygltflib import GLTF2, BufferView
+    except ImportError as e:
+        logger.warning(
+            f"Draco compression requested but skipped: {e}. "
+            "Install `smtk_draco` and `pygltflib` to enable."
+        )
+        return
+
+    gltf = GLTF2().load(glb_path)
+    blob = bytes(gltf.binary_blob() or b"")
+    if not gltf.meshes or not blob:
+        logger.warning("Draco compression: no meshes or empty binary blob; skipping.")
+        return
+
+    def _read_accessor_bytes(accessor_idx):
+        a = gltf.accessors[accessor_idx]
+        if a.bufferView is None:
+            return None
+        bv = gltf.bufferViews[a.bufferView]
+        elem_size = _GLTF_COMPONENT_SIZES[a.componentType] * _GLTF_TYPE_COUNTS[a.type]
+        offset = (bv.byteOffset or 0) + (a.byteOffset or 0)
+        stride = bv.byteStride or elem_size
+        if stride == elem_size:
+            return blob[offset:offset + elem_size * a.count]
+        out = bytearray(elem_size * a.count)
+        for i in range(a.count):
+            src = offset + i * stride
+            out[i * elem_size:(i + 1) * elem_size] = blob[src:src + elem_size]
+        return bytes(out)
+
+    keep_old_bv_indices = set()
+    for img in (gltf.images or []):
+        if img.bufferView is not None:
+            keep_old_bv_indices.add(img.bufferView)
+
+    encoded_primitives = []
+    consumed_accessors = set()
+
+    for mi, mesh in enumerate(gltf.meshes):
+        for pi, prim in enumerate(mesh.primitives):
+            pos_idx = getattr(prim.attributes, "POSITION", None)
+            if pos_idx is None or prim.indices is None:
+                continue
+            vertex_count = gltf.accessors[pos_idx].count
+
+            encoder = draco.Encoder(vertex_count)
+            attr_id_map = {}
+            local_consumed = []
+            for attr_name in _DRACO_SUPPORTED_ATTRS:
+                acc_idx = getattr(prim.attributes, attr_name, None)
+                if acc_idx is None:
+                    continue
+                a = gltf.accessors[acc_idx]
+                attr_bytes = _read_accessor_bytes(acc_idx)
+                if attr_bytes is None:
+                    continue
+                attr_id = encoder.set_attribute(attr_name, a.componentType, a.type, attr_bytes)
+                attr_id_map[attr_name] = attr_id
+                local_consumed.append(acc_idx)
+
+            ind_acc = gltf.accessors[prim.indices]
+            ind_bytes = _read_accessor_bytes(prim.indices)
+            if ind_bytes is None:
+                continue
+            encoder.set_indices(ind_acc.componentType, ind_acc.count, ind_bytes)
+            encoder.set_compression_level(int(compression_level))
+            encoder.set_quantization_bits(
+                position=int(position_bits),
+                normal=int(normal_bits),
+                uv=int(uv_bits),
+                color=int(color_bits),
+                generic=int(generic_bits),
+            )
+            if not encoder.encode(True):
+                logger.warning(f"Draco encode failed for mesh {mi} primitive {pi}; skipping.")
+                continue
+            draco_bytes = bytes(encoder.get_byte_length())
+            encoder.copy(draco_bytes)
+            del encoder
+
+            consumed_accessors.update(local_consumed)
+            consumed_accessors.add(prim.indices)
+            encoded_primitives.append((mi, pi, draco_bytes, attr_id_map))
+
+    if not encoded_primitives:
+        logger.warning("Draco compression: no primitives encoded; skipping.")
+        return
+
+    new_blob = bytearray()
+    new_bvs = []
+    old_to_new_bv = {}
+
+    def _pad4():
+        if len(new_blob) % 4:
+            new_blob.extend(b"\x00" * (4 - len(new_blob) % 4))
+
+    for old_idx, bv in enumerate(gltf.bufferViews or []):
+        if old_idx not in keep_old_bv_indices:
+            continue
+        offset = bv.byteOffset or 0
+        length = bv.byteLength
+        new_bv = BufferView(buffer=0, byteOffset=len(new_blob), byteLength=length)
+        if bv.byteStride is not None:
+            new_bv.byteStride = bv.byteStride
+        if bv.target is not None:
+            new_bv.target = bv.target
+        new_bvs.append(new_bv)
+        old_to_new_bv[old_idx] = len(new_bvs) - 1
+        new_blob.extend(blob[offset:offset + length])
+        _pad4()
+
+    encoded_with_bv_idx = []
+    for (mi, pi, draco_bytes, attr_id_map) in encoded_primitives:
+        new_bv = BufferView(buffer=0, byteOffset=len(new_blob), byteLength=len(draco_bytes))
+        new_bvs.append(new_bv)
+        encoded_with_bv_idx.append((mi, pi, len(new_bvs) - 1, attr_id_map))
+        new_blob.extend(draco_bytes)
+        _pad4()
+
+    gltf.bufferViews = new_bvs
+    if gltf.buffers:
+        gltf.buffers[0].byteLength = len(new_blob)
+
+    for img in (gltf.images or []):
+        if img.bufferView is not None and img.bufferView in old_to_new_bv:
+            img.bufferView = old_to_new_bv[img.bufferView]
+
+    for ai, a in enumerate(gltf.accessors):
+        if ai in consumed_accessors:
+            a.bufferView = None
+            a.byteOffset = None
+        elif a.bufferView is not None and a.bufferView in old_to_new_bv:
+            a.bufferView = old_to_new_bv[a.bufferView]
+
+    for (mi, pi, draco_bv_idx, attr_id_map) in encoded_with_bv_idx:
+        prim = gltf.meshes[mi].primitives[pi]
+        if prim.extensions is None:
+            prim.extensions = {}
+        prim.extensions[_DRACO_EXT_NAME] = {
+            "bufferView": draco_bv_idx,
+            "attributes": attr_id_map,
+        }
+
+    if gltf.extensionsUsed is None:
+        gltf.extensionsUsed = []
+    if _DRACO_EXT_NAME not in gltf.extensionsUsed:
+        gltf.extensionsUsed.append(_DRACO_EXT_NAME)
+    if gltf.extensionsRequired is None:
+        gltf.extensionsRequired = []
+    if _DRACO_EXT_NAME not in gltf.extensionsRequired:
+        gltf.extensionsRequired.append(_DRACO_EXT_NAME)
+
+    if hasattr(gltf, "set_binary_blob"):
+        gltf.set_binary_blob(bytes(new_blob))
+    else:
+        gltf._glb_data = bytes(new_blob)
+    gltf.save(glb_path)
+
+    logger.info(
+        f"Draco compressed {len(encoded_primitives)} primitive(s); "
+        f"GLB now {os.path.getsize(glb_path)} bytes"
+    )
 
 
 def _log_vram(label):
@@ -490,11 +700,17 @@ Takes a mesh WITH UVs and bakes color/metallic/roughness from the VOXELGRID.
 Input mesh MUST have UVs (use UV Unwrap node first).
 
 Parameters:
-- texture_size: Resolution of baked textures (512-16384px)""",
+- texture_size: Resolution of baked textures (512-16384px)
+- texture_format: png (default, lossless) or jpeg (smaller GLB)
+- jpeg_quality: JPEG compression quality (1-100)""",
             inputs=[
                 io.Custom("TRIMESH").Input("trimesh"),
                 io.Custom("TRELLIS2_VOXELGRID").Input("voxelgrid"),
                 io.Int.Input("texture_size", default=2048, min=512, max=16384, step=512),
+                io.Combo.Input("texture_format", options=["png", "jpeg"], default="png", optional=True,
+                    tooltip="PNG is lossless. JPEG is much smaller but lossy and drops the alpha channel."),
+                io.Int.Input("jpeg_quality", default=85, min=1, max=100, step=1, optional=True,
+                    tooltip="JPEG compression quality (only used when texture_format=jpeg)."),
             ],
             outputs=[
                 io.Custom("TRIMESH").Output(display_name="trimesh"),
@@ -507,6 +723,8 @@ Parameters:
         trimesh,
         voxelgrid,
         texture_size=2048,
+        texture_format="png",
+        jpeg_quality=85,
     ):
         import torch
         import cv2
@@ -619,15 +837,22 @@ Parameters:
         roughness = cv2.inpaint(roughness, mask_inv, 1, cv2.INPAINT_TELEA)[..., None]
         alpha = cv2.inpaint(alpha, mask_inv, 1, cv2.INPAINT_TELEA)[..., None]
 
-        # Create PBR material
+        # Build PBR textures, optionally JPEG-compress for smaller GLB
+        base_color_img = Image.fromarray(np.concatenate([base_color, alpha], axis=-1))
+        mr_img = Image.fromarray(np.concatenate([
+            np.zeros_like(metallic),
+            roughness,
+            metallic,
+        ], axis=-1))
+        if texture_format == "jpeg":
+            base_color_img = _pil_to_jpeg(base_color_img, quality=jpeg_quality)
+            mr_img = _pil_to_jpeg(mr_img, quality=jpeg_quality)
+            logger.info(f"Textures compressed as JPEG (quality={jpeg_quality})")
+
         material = Trimesh.visual.material.PBRMaterial(
-            baseColorTexture=Image.fromarray(np.concatenate([base_color, alpha], axis=-1)),
+            baseColorTexture=base_color_img,
             baseColorFactor=np.array([255, 255, 255, 255], dtype=np.uint8),
-            metallicRoughnessTexture=Image.fromarray(np.concatenate([
-                np.zeros_like(metallic),
-                roughness,
-                metallic
-            ], axis=-1)),
+            metallicRoughnessTexture=mr_img,
             metallicFactor=1.0,
             roughnessFactor=1.0,
             alphaMode='OPAQUE',
@@ -1066,7 +1291,12 @@ Takes the voxelgrid_npz_path from "Shape to Textured Mesh" and:
 1. Optionally remeshes (Dual Contouring)
 2. Simplifies to decimation_target faces
 3. UV unwraps and bakes PBR textures
-4. Exports textured GLB""",
+4. Exports textured GLB
+
+Optional size reductions (both off by default):
+- texture_format=jpeg: lossy texture compression, drops alpha
+- draco_compress=True: KHR_draco_mesh_compression for geometry
+  (requires `smtk_draco` and `pygltflib` Python packages)""",
             inputs=[
                 io.String.Input("voxelgrid_path"),
                 io.Int.Input("decimation_target", default=500000, min=1000, max=5000000, step=1000, optional=True),
@@ -1079,6 +1309,14 @@ Takes the voxelgrid_npz_path from "Shape to Textured Mesh" and:
                 io.Boolean.Input("double_sided", default=False, optional=True,
                     tooltip="Mark material as double-sided in GLB (renders both front and back faces)."),
                 io.String.Input("filename_prefix", default="trellis2", optional=True),
+                io.Combo.Input("texture_format", options=["png", "jpeg"], default="png", optional=True,
+                    tooltip="PNG is lossless. JPEG is much smaller but lossy and drops the alpha channel."),
+                io.Int.Input("jpeg_quality", default=85, min=1, max=100, step=1, optional=True,
+                    tooltip="JPEG compression quality (only used when texture_format=jpeg)."),
+                io.Boolean.Input("draco_compress", default=False, optional=True,
+                    tooltip="Apply KHR_draco_mesh_compression to mesh geometry. Requires `smtk_draco` and `pygltflib`."),
+                io.Int.Input("draco_compression_level", default=7, min=0, max=10, step=1, optional=True,
+                    tooltip="Draco compression level (0=fastest, 10=smallest). Only used when draco_compress=True."),
             ],
             outputs=[
                 io.String.Output(display_name="glb_path"),
@@ -1096,6 +1334,10 @@ Takes the voxelgrid_npz_path from "Shape to Textured Mesh" and:
         remove_inner_faces=False,
         double_sided=False,
         filename_prefix="trellis2",
+        texture_format="png",
+        jpeg_quality=85,
+        draco_compress=False,
+        draco_compression_level=7,
     ):
         import json
         import torch
@@ -1279,11 +1521,18 @@ Takes the voxelgrid_npz_path from "Shape to Textured Mesh" and:
         roughness = cv2.inpaint(roughness, mask_inv, 1, cv2.INPAINT_TELEA)[..., None]
         alpha = cv2.inpaint(alpha, mask_inv, 1, cv2.INPAINT_TELEA)[..., None]
 
-        # --- 13. Build PBR material ---
+        # --- 13. Build PBR material (optionally JPEG-compress textures) ---
+        base_color_img = Image.fromarray(np.concatenate([base_color, alpha], axis=-1))
+        mr_img = Image.fromarray(np.concatenate([np.zeros_like(metallic), roughness, metallic], axis=-1))
+        if texture_format == "jpeg":
+            base_color_img = _pil_to_jpeg(base_color_img, quality=jpeg_quality)
+            mr_img = _pil_to_jpeg(mr_img, quality=jpeg_quality)
+            logger.info(f"Textures compressed as JPEG (quality={jpeg_quality})")
+
         material = Trimesh.visual.material.PBRMaterial(
-            baseColorTexture=Image.fromarray(np.concatenate([base_color, alpha], axis=-1)),
+            baseColorTexture=base_color_img,
             baseColorFactor=np.array([255, 255, 255, 255], dtype=np.uint8),
-            metallicRoughnessTexture=Image.fromarray(np.concatenate([np.zeros_like(metallic), roughness, metallic], axis=-1)),
+            metallicRoughnessTexture=mr_img,
             metallicFactor=1.0,
             roughnessFactor=1.0,
             alphaMode='OPAQUE',
@@ -1321,6 +1570,9 @@ Takes the voxelgrid_npz_path from "Shape to Textured Mesh" and:
         logger.info(f"  trimesh valid={textured_mesh.is_volume if hasattr(textured_mesh, 'is_volume') else 'N/A'}")
         textured_mesh.export(output_path, file_type='glb')
         logger.info(f"GLB exported: {output_path} size={os.path.getsize(output_path)} bytes")
+
+        if draco_compress:
+            _draco_compress_glb(output_path, compression_level=draco_compression_level)
 
         del textured_mesh, out_vertices, out_faces, out_uvs, out_normals, mesh
         gc.collect()
