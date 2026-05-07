@@ -1596,12 +1596,20 @@ class Trellis2ExportTrimesh(io.ComfyNode):
             is_output_node=True,
             description="""Export trimesh to various 3D file formats.
 
-Supports: GLB, OBJ, PLY, STL, 3MF, DAE""",
+Supports: GLB, OBJ, PLY, STL, 3MF, DAE
+
+Optional size reduction (off by default):
+- draco_compress=True: KHR_draco_mesh_compression for geometry (GLB only).
+  Requires `smtk_draco` and `pygltflib` Python packages.""",
             inputs=[
                 io.Custom("TRIMESH").Input("trimesh"),
                 io.String.Input("filename_prefix", default="trellis2", optional=True),
                 io.Combo.Input("file_format", options=["glb", "obj", "ply", "stl", "3mf", "dae"],
                                default="glb", optional=True),
+                io.Boolean.Input("draco_compress", default=False, optional=True,
+                    tooltip="Apply KHR_draco_mesh_compression to mesh geometry (GLB only). Requires `smtk_draco` and `pygltflib`."),
+                io.Int.Input("draco_compression_level", default=7, min=0, max=10, step=1, optional=True,
+                    tooltip="Draco compression level (0=fastest, 10=smallest). Only used when draco_compress=True and file_format=glb."),
             ],
             outputs=[
                 io.String.Output(display_name="file_path"),
@@ -1609,7 +1617,14 @@ Supports: GLB, OBJ, PLY, STL, 3MF, DAE""",
         )
 
     @classmethod
-    def execute(cls, trimesh, filename_prefix="trellis2", file_format="glb"):
+    def execute(
+        cls,
+        trimesh,
+        filename_prefix="trellis2",
+        file_format="glb",
+        draco_compress=False,
+        draco_compression_level=7,
+    ):
         now = datetime.now()
         timestamp = now.strftime("%Y%m%d_%H%M%S")
         filename = f"{filename_prefix}_{timestamp}.{file_format}"
@@ -1621,6 +1636,14 @@ Supports: GLB, OBJ, PLY, STL, 3MF, DAE""",
         trimesh.export(str(output_path), file_type=file_format)
 
         logger.info(f"Exported to: {output_path}")
+
+        if draco_compress:
+            if file_format == "glb":
+                _draco_compress_glb(str(output_path), compression_level=draco_compression_level)
+            else:
+                logger.warning(
+                    f"draco_compress=True ignored: only supported for file_format='glb', got '{file_format}'."
+                )
 
         return io.NodeOutput(str(output_path))
 
