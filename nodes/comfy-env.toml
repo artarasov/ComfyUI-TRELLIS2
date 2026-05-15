@@ -31,6 +31,13 @@ numpy = ">=1.21.0"
 easydict = "*"
 tqdm = "*"
 
+# Optional Draco mesh compression (KHR_draco_mesh_compression GLB export).
+# Imported lazily from _draco_compress_glb in nodes_unwrap.py; when these are
+# missing the node logs a warning and skips compression. They must live in
+# this pixi env because Trellis2 nodes execute in an isolated subprocess.
+smtk_draco = "*"
+pygltflib = "*"
+
 [env_vars]
 PYTORCH_CUDA_ALLOC_CONF = "expandable_segments:True"
 
